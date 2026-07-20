@@ -35,6 +35,7 @@ pub mod high_level;
 pub mod middleware;
 
 pub mod anthropic;
+pub mod fake;
 pub mod gemini;
 pub mod ominix;
 pub mod openai;

@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// Splash Counter Pipeline — generates and deploys a native counter app
+// via the Makepad/Splash UI framework.
+//
+// Flow:
+//   generate_app ──→ deploy_app
+//
+// Tool contract:
+//   launch_app   — sends Splash DSL body to the Makepad host for rendering
+//   message      — sends text responses back to the user through the channel
+
+digraph splash_counter {
+    graph [label="Splash Counter App Pipeline", default_model="splash-counter"]
+
+    // --- Generate the Splash counter app using the fake provider ---
+    generate_app [
+        handler="codergen",
+        prompt="You are a native UI generator. Generate a Splash DSL counter application.
+
+The user wants a simple counter app with:
+- A window with title 'octos Counter'
+- A numeric display showing the current count
+- Increment (+) and decrement (-) buttons
+- A reset button
+- A 'Say Hello' button that sends a message back to the agent via __pi_response.set_text()
+
+The app must use Splash DSL syntax with:
+- App { } as root
+- Window { } with title, width, height
+- Body { } with padding and spacing
+- VStack and HStack for layout
+- Button widgets with name attributes for event handling
+- Text widgets with name attributes for rendering dynamic values
+- State { } block declaring the count variable
+- Action: blocks for each button
+
+Output ONLY the Splash DSL body. No markdown, no explanation.",
+        label="Generate App",
+        model="splash-counter",
+        timeout_secs="60"
+    ]
+
+    // --- Deploy the app to the Makepad host ---
+    deploy_app [
+        handler="codergen",
+        prompt="You are a native UI deployer. Deploy the Splash app to the Makepad host.
+
+Use the output from the previous node as the Splash DSL body.
+
+Call the launch_app tool with the Splash DSL body to render it in a native window.
+
+After launching, tell the user the app is running with instructions on how to interact with it.
+
+Available tools: launch_app, message",
+        label="Deploy App",
+        model="splash-counter",
+        tools="message",
+        timeout_secs="120"
+    ]
+
+    // --- Edges ---
+    generate_app -> deploy_app
+}

@@ -676,6 +676,7 @@ pub mod list_dir;
 pub mod manage_skills;
 pub mod mcp_agent;
 pub mod memory_note;
+pub mod launch_app;
 pub mod message;
 pub mod read_file;
 pub mod read_task_output;
@@ -735,6 +736,7 @@ pub use mcp_agent::{
     record_dispatch,
 };
 pub use memory_note::MemoryNoteTool;
+pub use launch_app::LaunchAppTool;
 pub use message::MessageTool;
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;

@@ -64,4 +64,4 @@ pub use server::{
 pub use stylesheet::{ModelStylesheet, ResolvedStyle, StyleRule};
 pub use thread::{Thread, ThreadRegistry};
 pub use tool::RunPipelineTool;
-pub use validate::{LintDiagnostic, Severity, validate};
+pub use validate::{LintDiagnostic, PipelineDiagnostic, Severity, diagnostics, validate};

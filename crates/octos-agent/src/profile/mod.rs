@@ -84,6 +84,7 @@ const BUILTIN_PROFILES: &[(&str, &str)] = &[
         include_str!("../assets/profiles/coding-full.json"),
     ),
     ("swarm", include_str!("../assets/profiles/swarm.json")),
+    ("a2app", include_str!("../assets/profiles/a2app.json")),
 ];
 
 /// The source a resolved profile was loaded from. Used by the CLI resolver

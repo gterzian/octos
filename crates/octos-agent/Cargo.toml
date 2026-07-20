@@ -33,6 +33,7 @@ which = { workspace = true }
 regex = { workspace = true }
 ignore = { workspace = true }
 futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
 reqwest = { workspace = true }
 # MCP over the official rmcp SDK. Client: stdio + streamable-HTTP + OAuth 2.1.
 # Server (`octos mcp-serve`): `server` + `transport-io` (stdio handler) and

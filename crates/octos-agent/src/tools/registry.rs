@@ -1277,6 +1277,7 @@ impl ToolRegistry {
         // found" miss. Follow-up to wire a real backend lives on
         // issue #1149.
         registry.register(ImageGenerationTool::new());
+        registry.register(crate::tools::LaunchAppTool::new());
         // Final refresh so the catalog reflects the just-registered
         // search/suggest tools too (cosmetic — they show up in their
         // own search results).

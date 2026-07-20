@@ -24,6 +24,8 @@ mod discord;
 mod email;
 #[cfg(feature = "feishu")]
 mod feishu;
+#[cfg(feature = "makepad")]
+mod makepad;
 #[cfg(feature = "line")]
 mod line;
 #[cfg(feature = "matrix")]
@@ -118,6 +120,8 @@ pub fn register_all(
         let _ = channel_index;
         match entry.channel_type.as_str() {
             "cli" => cli::register(channel_mgr, entry, ctx.shutdown, ctx.shutdown_notify)?,
+            #[cfg(feature = "makepad")]
+            "makepad" => makepad::register(channel_mgr, entry)?,
             #[cfg(feature = "telegram")]
             "telegram" => telegram::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "discord")]

@@ -15,6 +15,7 @@ use crate::provider::LlmProvider;
 mod anthropic;
 mod dashscope;
 mod deepseek;
+mod fake;
 mod gemini;
 mod groq;
 mod minimax;
@@ -114,6 +115,7 @@ impl ProviderEntry {
 /// specific patterns should come before catch-all providers like groq.
 static ALL: &[ProviderEntry] = &[
     anthropic::ENTRY,
+    fake::ENTRY,
     openai::ENTRY,
     gemini::ENTRY,
     vertex::ENTRY,
@@ -230,7 +232,7 @@ mod tests {
 
     #[test]
     fn all_entries_count() {
-        assert_eq!(all_entries().len(), 16);
+        assert_eq!(all_entries().len(), 17);
     }
 
     #[test]
@@ -260,6 +262,11 @@ mod tests {
         assert_eq!(detect_provider("glm-4-plus"), Some("zhipu"));
         assert_eq!(detect_provider("MiniMax-M2.5"), Some("minimax"));
         assert_eq!(detect_provider("llama-3.3-70b"), Some("groq"));
+    }
+
+    #[test]
+    fn detect_fake_provider() {
+        assert_eq!(detect_provider("splash-counter"), Some("fake"));
     }
 
     #[test]
