@@ -27,7 +27,6 @@ members = [
     "crates/octos-plugin",
     "crates/octos-sandbox",
     "crates/octos-swarm",
-    "crates/a2app-launcher",
 ]
 
 [workspace.package]
