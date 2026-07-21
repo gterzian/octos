@@ -20,8 +20,6 @@ pub mod api_channel;
 pub mod dingtalk_channel;
 #[cfg(feature = "discord")]
 pub mod discord_channel;
-#[cfg(feature = "makepad")]
-pub mod makepad_channel;
 #[cfg(feature = "email")]
 pub mod email_channel;
 #[cfg(feature = "feishu")]
@@ -76,8 +74,6 @@ pub use api_channel::{ApiChannel, TaskCancelOutcome, TaskRelaunchOutcome};
 pub use dingtalk_channel::DingTalkChannel;
 #[cfg(feature = "discord")]
 pub use discord_channel::DiscordChannel;
-#[cfg(feature = "makepad")]
-pub use makepad_channel::{MakepadChannel, MakepadInboundMessage, MakepadOutboundMessage, build_launch_message, build_stream_delta, build_response_message};
 #[cfg(feature = "email")]
 pub use email_channel::EmailChannel;
 #[cfg(feature = "feishu")]

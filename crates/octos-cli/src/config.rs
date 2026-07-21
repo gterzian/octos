@@ -1993,7 +1993,6 @@ impl Config {
         if let Some(ref gw) = self.gateway {
             const VALID_CHANNELS: &[&str] = &[
                 "cli",
-                "makepad",
                 "telegram",
                 "discord",
                 "dingtalk",
