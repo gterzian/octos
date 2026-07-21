@@ -3,17 +3,6 @@
 version = 4
 
 [[package]]
-name = "a2app-launcher"
-version = "2.0.1"
-dependencies = [
- "eyre",
- "futures",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.26.2",
-]
-
-[[package]]
 name = "account-manager"
 version = "1.0.0"
 dependencies = [

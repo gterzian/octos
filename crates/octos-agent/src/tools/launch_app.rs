@@ -146,7 +146,7 @@ impl Tool for LaunchAppTool {
 
         // Check if harness is already running
         if !is_harness_running().await {
-            eprintln!("[launch_app] Launching fresh harness...");
+            tracing::info!(target: "launch_app", "Launching fresh harness");
             match launch_harness() {
                 Ok(child) => {
                     // Store the child so Drop kills it on shutdown
@@ -172,7 +172,7 @@ impl Tool for LaunchAppTool {
             for _ in 0..30 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 if is_harness_running().await {
-                    eprintln!("[launch_app] Harness is ready");
+                    tracing::info!(target: "launch_app", "Harness is ready");
                     ready = true;
                     break;
                 }

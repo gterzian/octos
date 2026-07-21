@@ -1,18 +1,10 @@
 {
   "name": "a2app",
   "version": 1,
-  "description": "Agent-to-App (a2app) profile — builds and deploys native Makepad/Splash UIs. Uses the fake Splash counter provider for testing the Makepad channel adapter and pipeline deployment flow.",
+  "description": "Agent-to-App profile — deploys Splash DSL apps to a Makepad native UI host via the launch_app tool.",
   "tools": {
     "mode": "allow_list",
-    "tools": [
-      "group:fs",
-      "group:runtime",
-      "launch_app",
-      "message",
-      "spawn"
-    ]
+    "tools": ["launch_app"]
   },
-  "mcp_servers": [],
-  "permissions": "default",
-  "agents": ["research-worker", "repo-editor"]
+  "permissions": "default"
 }
