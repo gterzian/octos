@@ -2074,6 +2074,7 @@ mod tests {
             oauth: false,
             scopes: Vec::new(),
             concurrency_class: None,
+            tool_call_timeout_secs: None,
         }
     }
 

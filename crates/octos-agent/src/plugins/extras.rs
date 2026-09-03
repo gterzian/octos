@@ -212,6 +212,9 @@ fn resolve_mcp_server(srv: &SkillMcpServer, skill_dir: &Path) -> McpServerConfig
         // it copied into this field; until then, the bundled servers
         // run in the parallel-friendly path.
         concurrency_class: None,
+        // Skill-bundled servers keep the operator-config 60s tools/call
+        // budget (the override is for client-advertised servers).
+        tool_call_timeout_secs: None,
     }
 }
 

@@ -41,7 +41,8 @@ pub(crate) type McpService = Arc<RunningService<RoleClient, ClientInfo>>;
 
 /// How long to wait for the MCP `initialize` handshake before giving up.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a single `tools/call` may run before it is cancelled.
+/// How long a single `tools/call` may run before it is cancelled, when the
+/// server config does not override it ([`McpServerConfig::tool_call_timeout_secs`]).
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum nesting depth for MCP tool input schemas.
 const MAX_SCHEMA_DEPTH: usize = 10;
@@ -82,6 +83,16 @@ pub struct McpServerConfig {
     /// downgrade enforcement).
     #[serde(default)]
     pub concurrency_class: Option<String>,
+    /// Per-server override for how long a single `tools/call` may run before
+    /// it is cancelled. Absent → the 60s default ([`TOOL_CALL_TIMEOUT`]).
+    ///
+    /// Operator config rarely needs this; it exists for client-advertised
+    /// servers (ACP `session/new` `mcpServers`), where the embedding client
+    /// has already decided its own tools may run long (e.g. a blocking app
+    /// generation) and stamps a generous budget on the servers it points the
+    /// agent at.
+    #[serde(default)]
+    pub tool_call_timeout_secs: Option<u64>,
 }
 
 impl McpServerConfig {
@@ -328,6 +339,9 @@ struct McpToolSpec {
     input_schema: serde_json::Value,
     service: McpService,
     concurrency_class: crate::tools::ConcurrencyClass,
+    /// Per-server override for how long `tools/call` may run (see
+    /// [`McpServerConfig::tool_call_timeout_secs`]). `None` → the 60s default.
+    tool_call_timeout_secs: Option<u64>,
 }
 
 /// A running set of MCP server connections and the tools they expose.
@@ -424,6 +438,7 @@ impl McpClient {
                             input_schema: schema,
                             service: service.clone(),
                             concurrency_class,
+                            tool_call_timeout_secs: config.tool_call_timeout_secs,
                         });
                     }
                     services.push((server_name, service));
@@ -551,6 +566,7 @@ impl McpClient {
                 input_schema: spec.input_schema,
                 service: spec.service,
                 concurrency_class: spec.concurrency_class,
+                tool_call_timeout_secs: spec.tool_call_timeout_secs,
             });
         }
     }
@@ -563,6 +579,8 @@ struct McpTool {
     input_schema: serde_json::Value,
     service: McpService,
     concurrency_class: crate::tools::ConcurrencyClass,
+    /// Per-server override for how long `tools/call` may run; `None` → 60s.
+    tool_call_timeout_secs: Option<u64>,
 }
 
 #[async_trait]
@@ -587,11 +605,18 @@ impl Tool for McpTool {
         let mut param = CallToolRequestParams::new(self.name.clone());
         param.arguments = args.as_object().cloned();
 
-        let result = timeout(TOOL_CALL_TIMEOUT, self.service.call_tool(param))
+        // The per-server timeout override exists so a client-advertised server
+        // whose tools genuinely run long (e.g. a blocking app generation) is
+        // not cancelled at the operator-config default.
+        let call_timeout = self
+            .tool_call_timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(TOOL_CALL_TIMEOUT);
+        let result = timeout(call_timeout, self.service.call_tool(param))
             .await
             .map_err(|_| {
                 eyre::eyre!(
-                    "MCP tool '{}' call timed out after {TOOL_CALL_TIMEOUT:?}",
+                    "MCP tool '{}' call timed out after {call_timeout:?}",
                     self.name
                 )
             })?
@@ -629,7 +654,29 @@ mod tests {
             oauth: false,
             scopes: vec![],
             concurrency_class: None,
+            tool_call_timeout_secs: None,
         }
+    }
+
+    #[test]
+    fn tool_call_timeout_defaults_to_sixty_seconds() {
+        let c = cfg();
+        assert_eq!(c.tool_call_timeout_secs, None);
+        // A config-file round trip must preserve the override and default the
+        // absent field to `None` (the 60s default lives in `McpTool::execute`).
+        let mut with = cfg();
+        with.tool_call_timeout_secs = Some(600);
+        let json = serde_json::to_string(&with).unwrap();
+        let back: McpServerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tool_call_timeout_secs, Some(600));
+        let plain: McpServerConfig = serde_json::from_str(
+            r#"{"command":"echo","args":[],"env":{},"url":null,"headers":{},"oauth":false,"scopes":[],"concurrency_class":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            plain.tool_call_timeout_secs, None,
+            "an absent field in an existing config file must keep the 60s default"
+        );
     }
 
     #[test]

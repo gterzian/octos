@@ -917,3 +917,250 @@ async fn should_sanitize_stored_history_when_loading_a_session() {
         "sanitized history must not hand the LLM payload-free rows: {last:?}"
     );
 }
+
+// ── Client-advertised MCP servers (`session/new` `mcpServers`) ──────────────
+//
+// A client can point the agent at MCP servers in `session/new`; octos must
+// connect to them per session and expose their tools to the model. E2E over
+// the REAL handler wiring (`spawn_acp_agent`, the same one `octos acp`
+// serves): the client advertises a canned stdio MCP server (a shell script,
+// the same shape as Robrix's `--mcp-bridge` relay), and a scripted LLM calls
+// the advertised tool — a full model → registry → rmcp → subprocess → back
+// round trip, observable through the ACP `session/update` stream.
+
+#[cfg(unix)]
+mod client_mcp_e2e {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    use agent_client_protocol::schema::v1::{McpServer, McpServerStdio, ToolCallContent};
+    use octos_llm::{ChatResponse, LlmProvider, TokenUsage};
+
+    /// Canned stdio MCP server (a shell script) that answers `initialize`,
+    /// `tools/list` (advertising one tool named `{tool_name}`) and
+    /// `tools/call`. Notification frames are skipped.
+    fn write_mcp_server(dir: &Path, tool_name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("client-mcp-server.sh");
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *initialized*) : ;;
+    *initialize*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fake-mcp","version":"1.0.0"}}}\n' "$id"
+      ;;
+    *tools/list*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"%s","description":"a fake MCP tool for acp tests","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id" "{tool_name}"
+      ;;
+    *tools/call*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"fake-mcp-ran"}],"isError":false}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace("{tool_name}", tool_name);
+        std::fs::write(&path, script).expect("write client mcp server");
+        let mut perms = std::fs::metadata(&path).expect("stat client mcp server").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod client mcp server");
+        path
+    }
+
+    /// A scripted LLM: the FIRST `chat()` asks for one tool call to
+    /// `tool_name`; every later call ends the turn. Records the tool specs
+    /// each call was offered, so the test can assert the MCP tool was
+    /// registered and advertised to the model.
+    struct ToolCallingLlm {
+        tool_name: String,
+        final_reply: String,
+        calls: AtomicUsize,
+        /// One entry per `chat()` call: the names of the tools offered.
+        seen_tools: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ToolCallingLlm {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            self.seen_tools
+                .lock()
+                .await
+                .push(tools.iter().map(|t| t.name.clone()).collect());
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![octos_core::ToolCall {
+                        id: "call-fake-mcp-1".to_string(),
+                        name: self.tool_name.clone(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: octos_llm::StopReason::ToolUse,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                });
+            }
+            Ok(ChatResponse {
+                content: Some(self.final_reply.clone()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn provider_name(&self) -> &str {
+            "tool-calling-mock"
+        }
+
+        fn model_id(&self) -> &str {
+            "tool-calling-mock-1"
+        }
+    }
+
+    /// `session/new` advertises an MCP server; the model must be offered its
+    /// tool and a prompt that calls it must round trip through the stdio
+    /// server child and back to the client as a completed tool call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn should_register_and_call_a_client_mcp_tool_advertised_in_session_new() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let server_script = write_mcp_server(tmp.path(), "fake_client_tool");
+
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let llm: Arc<dyn LlmProvider> = Arc::new(ToolCallingLlm {
+            tool_name: "fake_client_tool".to_string(),
+            final_reply: "the counter app is running".to_string(),
+            calls: AtomicUsize::new(0),
+            seen_tools: seen.clone(),
+        });
+        let factory = TestAgentFactory::new(llm, memory_dir, cwd.clone());
+        let transport = OctosAcpAgentTransport::new(factory);
+
+        let updates: Arc<Mutex<Vec<SessionUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_for_handler = updates.clone();
+        let stop_reason: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
+        let stop_for_main = stop_reason.clone();
+        let prompt_cwd = cwd.clone();
+        let script_for_client = server_script.display().to_string();
+
+        Client
+            .builder()
+            .name("octos-acp-client-mcp-client")
+            .on_receive_notification(
+                async move |notif: SessionNotification,
+                            _cx: ConnectionTo<agent_client_protocol::Agent>| {
+                    updates_for_handler.lock().await.push(notif.update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                transport,
+                |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+
+                    // session/new WITH the client's stdio MCP server.
+                    let new_session = connection
+                        .send_request(
+                            NewSessionRequest::new(prompt_cwd.clone()).mcp_servers(vec![
+                                McpServer::Stdio(McpServerStdio::new(
+                                    "robrix-tools",
+                                    script_for_client.clone(),
+                                )),
+                            ]),
+                        )
+                        .block_task()
+                        .await?;
+                    let session_id = new_session.session_id;
+
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::Text(TextContent::new("make a counter app"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    *stop_for_main.lock().await = Some(prompt.stop_reason);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("ACP client run should complete cleanly");
+
+        // The turn ended naturally after the tool round trip.
+        assert!(
+            matches!(*stop_reason.lock().await, Some(StopReason::EndTurn)),
+            "expected EndTurn after the tool round trip"
+        );
+
+        // The MCP tool was REGISTERED: the model's first chat() was offered it.
+        let snapshots = seen.lock().await;
+        assert!(
+            snapshots
+                .first()
+                .is_some_and(|tools| tools.iter().any(|t| t == "fake_client_tool")),
+            "the client-advertised MCP tool must be offered to the model; offered: {snapshots:?}"
+        );
+
+        // The tool call itself streamed to the client as an ACP ToolCall…
+        let recorded = updates.lock().await;
+        let tool_calls: Vec<&str> = recorded
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::ToolCall(call) => Some(call.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tool_calls.contains(&"fake_client_tool"),
+            "the model's call to the MCP tool must stream as a ToolCall update; got {tool_calls:?}"
+        );
+
+        // …the fake server's reply reached the model (a completed update
+        // carries its text content)…
+        let completions: Vec<String> = recorded
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::ToolCallUpdate(u) => u.fields.content.as_ref().and_then(|c| {
+                    c.iter().find_map(|chunk| match chunk {
+                        ToolCallContent::Content(block) => match &block.content {
+                            ContentBlock::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                }),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            completions.iter().any(|t| t.contains("fake-mcp-ran")),
+            "the tool result from the stdio server must reach the model; got {completions:?}"
+        );
+
+        // …and the turn finished with the model's summary text.
+        let agent_texts: Vec<String> = recorded.iter().filter_map(agent_message_text).collect();
+        assert!(
+            agent_texts.iter().any(|t| t.contains("the counter app is running")),
+            "the final assistant reply must stream; got {agent_texts:?}"
+        );
+    }
+}

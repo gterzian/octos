@@ -25,6 +25,7 @@ mod ollama;
 mod openai;
 mod openrouter;
 mod r9s;
+mod scenario;
 mod vertex;
 mod vllm;
 mod zai;
@@ -135,6 +136,9 @@ static ALL: &[ProviderEntry] = &[
     nvidia::ENTRY,
     ollama::ENTRY,
     vllm::ENTRY,
+    // Deliberately LAST: a test-only, opt-in provider that must never be
+    // auto-detected or crowd out real provider patterns.
+    scenario::ENTRY,
 ];
 
 // ── Public API ──────────────────────────────────────────────────────────────

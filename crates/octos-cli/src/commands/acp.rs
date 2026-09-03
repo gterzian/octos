@@ -62,7 +62,7 @@ use eyre::{Result, WrapErr};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, SessionId,
     SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields,
@@ -90,6 +90,14 @@ use crate::config::Config;
 /// the `Default` impl so an embedder building the command by hand gets the same
 /// budget the CLI does.
 pub const DEFAULT_MAX_ITERATIONS: u32 = 20;
+
+/// Tool-call timeout (seconds) stamped on client-advertised MCP servers
+/// (ACP `session/new` `mcpServers`). These are trusted by the embedding
+/// client that pointed the agent at them — some of their tools are
+/// minutes-long by design (e.g. a blocking app build the client itself
+/// orchestrates) — so the 60s operator-config default would cancel real work.
+/// Operator-configured servers keep the 60s default.
+const CLIENT_MCP_TOOL_CALL_TIMEOUT_SECS: u64 = 600;
 
 /// Run octos as an ACP (Agent Client Protocol) agent over stdin/stdout.
 ///
@@ -199,6 +207,22 @@ pub trait SessionAgentFactory: Send + Sync {
     /// Build a runnable agent rooted at `cwd`, returning it plus the shared
     /// shutdown flag wired into it (flipped on `session/cancel`).
     async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)>;
+
+    /// [`Self::build`] plus the MCP servers the client advertised in
+    /// `session/new` (`mcpServers`), which must be connected and registered
+    /// into the built agent's session registry.
+    ///
+    /// Default: no client MCP servers (delegates to [`Self::build`]) — the
+    /// test factories override only `build`, and `session/load` (whose request
+    /// carries no servers) calls `build` directly, so restored sessions run
+    /// without client tools (known v1 limitation).
+    async fn build_with_mcp(
+        &self,
+        cwd: PathBuf,
+        _servers: &[octos_agent::McpServerConfig],
+    ) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
+        self.build(cwd).await
+    }
 
     /// Where ACP conversations are persisted, if anywhere. `None` means sessions
     /// will not survive a restart — the test factory, or a store that failed to open.
@@ -740,6 +764,16 @@ impl SessionAgentFactory for ConfigAgentFactory {
     }
 
     async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
+        // session/load (which carries no servers) and callers that have no
+        // client MCP advertisement both land here.
+        self.build_with_mcp(cwd, &[]).await
+    }
+
+    async fn build_with_mcp(
+        &self,
+        cwd: PathBuf,
+        client_mcp_servers: &[octos_agent::McpServerConfig],
+    ) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
         // Normalize the client-supplied cwd (resolve `..` + symlinks) up front so
         // the per-cwd cache key is stable and the session scope's `..`-rejecting
         // resolvers accept normal relative reads like `read_file("Cargo.toml")`
@@ -796,7 +830,7 @@ impl SessionAgentFactory for ConfigAgentFactory {
         // its own Arc-able registry. The helper re-applies the finalize
         // narrowing because the rebind re-registers cwd-bound builtins the
         // profile/policy filters had evicted (codex P1 on the lean default).
-        let tools = rebind_session_registry(
+        let mut tools = rebind_session_registry(
             &b.tool_specs,
             &cwd,
             create_sandbox(&b.sandbox),
@@ -806,6 +840,32 @@ impl SessionAgentFactory for ConfigAgentFactory {
             &shared.model_id,
             &b.profile,
         );
+
+        // Client-advertised MCP servers (ACP `session/new` `mcpServers`),
+        // connected and registered for THIS session.
+        //
+        // Deliberately AFTER `rebind_session_registry`: that helper ends by
+        // re-applying the profile/policy narrowing envelope, and the default
+        // coding profile is an allow-list that would evict these tools. A
+        // client that points the agent at a server has already decided the
+        // agent should have those tools, so the client's choice wins over
+        // octos's profile narrowing. The tools are still protected against
+        // shadowing octos built-ins by `McpClient::register_tools` itself.
+        //
+        // Fail-soft: a server that fails to connect (missing binary, refused
+        // handshake) is logged and the session runs without it — matching
+        // config-file MCP behaviour — never aborting session/new.
+        if !client_mcp_servers.is_empty() {
+            match octos_agent::McpClient::start(client_mcp_servers).await {
+                Ok(client) => client.register_tools(&mut tools),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "client-advertised MCP servers failed to start; running without them"
+                    );
+                }
+            }
+        }
 
         // Per-session filesystem scope (codex P1): contain file tools + plugins to
         // cwd, with skill read-zones so `read_file` reaches SKILL.md references.
@@ -1034,8 +1094,27 @@ impl SessionAgentFactory for TestAgentFactory {
     }
 
     async fn build(&self, cwd: PathBuf) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
+        // No client MCP servers (session/load, or a session/new with none).
+        self.build_with_mcp(cwd, &[]).await
+    }
+
+    async fn build_with_mcp(
+        &self,
+        cwd: PathBuf,
+        client_mcp_servers: &[octos_agent::McpServerConfig],
+    ) -> Result<(Arc<Agent>, Arc<AtomicBool>)> {
         let memory = Arc::new(EpisodeStore::open(&self.memory_dir).await?);
-        let tools = build_acp_tool_registry(&cwd, &octos_agent::SandboxConfig::default());
+        let mut tools = build_acp_tool_registry(&cwd, &octos_agent::SandboxConfig::default());
+        // Test-support mirror of `ConfigAgentFactory::build_with_mcp`: a
+        // `session/new` that advertises MCP servers must hand the agent a
+        // registry exposing them, or the E2E proves nothing. Fail-soft, like
+        // production.
+        if !client_mcp_servers.is_empty() {
+            match octos_agent::McpClient::start(client_mcp_servers).await {
+                Ok(client) => client.register_tools(&mut tools),
+                Err(e) => tracing::warn!(error = %e, "test-factory client MCP init failed"),
+            }
+        }
         let shutdown = Arc::new(AtomicBool::new(false));
         let agent = Agent::new(AgentId::new("acp-test"), self.llm.clone(), tools, memory)
             .with_shutdown(shutdown.clone());
@@ -1198,19 +1277,86 @@ fn build_initialize_response(req: &InitializeRequest) -> InitializeResponse {
     InitializeResponse::new(negotiated).agent_capabilities(caps)
 }
 
+/// ACP `session/new` `mcpServers` → octos MCP config. Stdio maps 1:1
+/// (command/args/env); `Http` → url + headers (streamable-HTTP); legacy
+/// `Sse` is unsupported by the rmcp-backed client and skipped with a warn.
+///
+/// Client-advertised servers get a generous per-tool call timeout
+/// ([`CLIENT_MCP_TOOL_CALL_TIMEOUT_SECS`]): the embedding client that pointed
+/// the agent at them trusts them and some run minutes-long tools by design.
+/// The 60s default stays for operator-config servers.
+///
+/// The ACP `name` is dropped — octos's [`octos_agent::McpServerConfig`]
+/// derives its display name from the command/url; tool grouping follows the
+/// server that exposed each tool.
+fn translate_client_mcp_servers(
+    servers: &[McpServer],
+) -> Vec<octos_agent::McpServerConfig> {
+    let mut out = Vec::new();
+    for server in servers {
+        match server {
+            McpServer::Stdio(s) => {
+                let env = s
+                    .env
+                    .iter()
+                    .map(|v| (v.name.clone(), v.value.clone()))
+                    .collect();
+                out.push(octos_agent::McpServerConfig {
+                    command: Some(s.command.to_string_lossy().into_owned()),
+                    args: s.args.clone(),
+                    env,
+                    url: None,
+                    headers: HashMap::new(),
+                    oauth: false,
+                    scopes: Vec::new(),
+                    concurrency_class: None,
+                    tool_call_timeout_secs: Some(CLIENT_MCP_TOOL_CALL_TIMEOUT_SECS),
+                });
+            }
+            McpServer::Http(h) => {
+                let headers = h
+                    .headers
+                    .iter()
+                    .map(|header| (header.name.clone(), header.value.clone()))
+                    .collect();
+                out.push(octos_agent::McpServerConfig {
+                    command: None,
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    url: Some(h.url.clone()),
+                    headers,
+                    oauth: false,
+                    scopes: Vec::new(),
+                    concurrency_class: None,
+                    tool_call_timeout_secs: Some(CLIENT_MCP_TOOL_CALL_TIMEOUT_SECS),
+                });
+            }
+            McpServer::Sse(s) => {
+                tracing::warn!(
+                    server = %s.name,
+                    "ACP session/new requested an SSE MCP server; unsupported \
+                     (octos's MCP client is streamable-HTTP only) — skipping"
+                );
+            }
+            // Any future ACP transport variant (the schema is #[non_exhaustive])
+            // has no octos transport mapping yet — skip it.
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Handle `session/new`: build a fresh octos agent and register it.
 async fn handle_new_session(
     factory: &dyn SessionAgentFactory,
     sessions: &SessionMap,
     req: NewSessionRequest,
 ) -> std::result::Result<NewSessionResponse, AcpError> {
-    // MCP servers requested by the client are ignored in v1 (logged only).
-    if !req.mcp_servers.is_empty() {
-        tracing::info!(
-            count = req.mcp_servers.len(),
-            "ACP session/new requested MCP servers; ignored in v1 (octos runs its own tools)"
-        );
-    }
+    // Client-advertised MCP servers are connected per session and registered
+    // AFTER profile narrowing so the default coding profile's allow-list
+    // cannot evict them (see `ConfigAgentFactory::build_with_mcp`). Stdio +
+    // streamable-HTTP translate 1:1; legacy SSE is skipped with a warning.
+    let client_mcp_servers = translate_client_mcp_servers(&req.mcp_servers);
 
     let cwd = if req.cwd.as_os_str().is_empty() {
         factory.default_cwd().to_path_buf()
@@ -1219,7 +1365,7 @@ async fn handle_new_session(
     };
 
     let (agent, shutdown) = factory
-        .build(cwd)
+        .build_with_mcp(cwd, &client_mcp_servers)
         .await
         .map_err(|e| agent_client_protocol::util::internal_error(format!("build agent: {e}")))?;
 
@@ -1585,6 +1731,11 @@ async fn load_session_locked(
         req.cwd.clone()
     };
 
+    // NOTE: plain `build`, not `build_with_mcp` — an ACP `session/load`
+    // request carries no `mcpServers` (only `session/new` does), so a
+    // restored session runs without the client tools its original had. Known
+    // v1 limitation; the tool-server half of the embedding client must
+    // reconnect on its side if it wants them back.
     let (agent, shutdown) = factory
         .build(cwd)
         .await
@@ -1942,6 +2093,101 @@ fn replay_history(
 mod tests {
     use super::*;
 
+    use agent_client_protocol::schema::v1::{
+        EnvVariable, HttpHeader, McpServerHttp, McpServerSse, McpServerStdio,
+    };
+
+    // ── `session/new` mcpServers → octos config translation ──
+
+    #[test]
+    fn should_translate_stdio_mcp_server_with_full_env() {
+        let servers = [McpServer::Stdio(
+            McpServerStdio::new("robrix-tools", "/usr/bin/robrix")
+                .args(vec![
+                    "--mcp-bridge".into(),
+                    "--socket".into(),
+                    "/tmp/s.sock".into(),
+                ])
+                .env(vec![EnvVariable::new("ROBRIX_TOKEN", "secret")]),
+        )];
+        let out = translate_client_mcp_servers(&servers);
+        assert_eq!(out.len(), 1);
+        let cfg = &out[0];
+        assert_eq!(cfg.command.as_deref(), Some("/usr/bin/robrix"));
+        assert_eq!(cfg.args, vec!["--mcp-bridge", "--socket", "/tmp/s.sock"]);
+        assert_eq!(
+            cfg.env.get("ROBRIX_TOKEN").map(String::as_str),
+            Some("secret")
+        );
+        assert_eq!(cfg.url, None);
+        assert!(cfg.headers.is_empty());
+        assert_eq!(
+            cfg.tool_call_timeout_secs,
+            Some(CLIENT_MCP_TOOL_CALL_TIMEOUT_SECS),
+            "client-advertised servers get the generous tool-call budget"
+        );
+    }
+
+    #[test]
+    fn should_translate_stdio_mcp_server_without_env() {
+        let servers = [McpServer::Stdio(McpServerStdio::new("tools", "my-server"))];
+        let out = translate_client_mcp_servers(&servers);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].command.as_deref(), Some("my-server"));
+        assert!(out[0].args.is_empty());
+        assert!(out[0].env.is_empty(), "an env-less stdio server gets an empty env map");
+        assert_eq!(
+            out[0].tool_call_timeout_secs,
+            Some(CLIENT_MCP_TOOL_CALL_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn should_translate_http_mcp_server_to_url_and_headers() {
+        let servers = [McpServer::Http(
+            McpServerHttp::new("remote", "https://mcp.example.com/mcp").headers(vec![
+                HttpHeader::new("Authorization", "Bearer x"),
+            ]),
+        )];
+        let out = translate_client_mcp_servers(&servers);
+        assert_eq!(out.len(), 1);
+        let cfg = &out[0];
+        assert_eq!(cfg.url.as_deref(), Some("https://mcp.example.com/mcp"));
+        assert_eq!(
+            cfg.headers.get("Authorization").map(String::as_str),
+            Some("Bearer x")
+        );
+        assert_eq!(cfg.command, None);
+        assert!(cfg.env.is_empty());
+        assert_eq!(
+            cfg.tool_call_timeout_secs,
+            Some(CLIENT_MCP_TOOL_CALL_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn should_skip_sse_mcp_server_with_a_warning() {
+        let servers = [McpServer::Sse(McpServerSse::new("legacy", "https://old.example.com/sse"))];
+        let out = translate_client_mcp_servers(&servers);
+        assert!(
+            out.is_empty(),
+            "rmcp is streamable-HTTP only; an SSE server is skipped, not translated"
+        );
+    }
+
+    #[test]
+    fn should_translate_a_mixture_and_preserve_order() {
+        let servers = vec![
+            McpServer::Stdio(McpServerStdio::new("a", "cmd-a")),
+            McpServer::Sse(McpServerSse::new("b", "https://x/sse")),
+            McpServer::Http(McpServerHttp::new("c", "https://y/mcp")),
+        ];
+        let out = translate_client_mcp_servers(&servers);
+        assert_eq!(out.len(), 2, "the SSE entry is dropped");
+        assert_eq!(out[0].command.as_deref(), Some("cmd-a"));
+        assert_eq!(out[1].url.as_deref(), Some("https://y/mcp"));
+    }
+
     /// A stored user message, thread-stamped the way `run_prompt_turn` stamps
     /// every row of a turn (the store is fail-closed for unstamped rows).
     fn stored_user(content: &str, thread: &str) -> octos_core::Message {
@@ -2216,6 +2462,103 @@ mod tests {
             );
         }
     }
+
+    /// A throwaway stdio MCP server (a shell script) that answers
+    /// `initialize` and then `tools/list`, advertising a single tool named
+    /// `{tool_name}`. Mirrors the fake-server pattern from
+    /// `octos-agent/tests/mcp_agent_backend.rs`: the `--mcp-bridge` relay
+    /// Robrix spawns is a stdio server of exactly this shape, so connecting
+    /// here exercises the real rmcp client transport end to end.
+    #[cfg(unix)]
+    fn write_fake_stdio_mcp_server(dir: &std::path::Path, tool_name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-mcp-server.sh");
+        let script = r#"#!/bin/sh
+# Minimal MCP stdio server: answer `initialize`, then `tools/list` with a
+# single tool. Frames without a recognized request are ignored.
+while IFS= read -r line; do
+  case "$line" in
+    *initialized*) : ;; # notifications/initialized, notifications/cancelled, …
+    *initialize*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fake-mcp","version":"1.0.0"}}}\n' "$id"
+      ;;
+    *tools/list*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"%s","description":"a fake tool for acp tests","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id" "{tool_name}"
+      ;;
+  esac
+done
+"#
+            .replace("{tool_name}", tool_name);
+        std::fs::write(&path, script).expect("write fake mcp server script");
+        let mut perms = std::fs::metadata(&path).expect("stat fake mcp server").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod fake mcp server");
+        path
+    }
+
+    /// Client-advertised MCP servers are registered AFTER the profile
+    /// narrowing envelope (the `coding` default is an allow-list that would
+    /// otherwise evict them). Locks in that ordering on the production
+    /// helpers: a tool registered before `finalize_tool_registry` disappears;
+    /// the same tool registered after it — the `ConfigAgentFactory::build_with_mcp`
+    /// order — stays visible in the session registry.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_keep_client_mcp_tools_when_registered_after_profile_narrowing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = write_fake_stdio_mcp_server(dir.path(), "fake_client_tool");
+        let config = octos_agent::McpServerConfig {
+            command: Some(script.display().to_string()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+            oauth: false,
+            scopes: Vec::new(),
+            concurrency_class: None,
+            tool_call_timeout_secs: Some(600),
+        };
+        let profile =
+            octos_agent::profile::ProfileDefinition::builtin("coding").expect("coding builtin");
+        let sandbox = create_sandbox(&octos_agent::SandboxConfig::default());
+
+        // A registry narrowed to the coding profile has no client tool in it.
+        let mut after = ToolRegistry::with_builtins_and_sandbox(dir.path(), sandbox);
+        finalize_tool_registry(&mut after, &Config::default(), "openai", "gpt-test", &profile);
+        assert!(
+            !after.is_tool_visible("fake_client_tool"),
+            "baseline: the coding allow-list alone does not expose the client tool"
+        );
+
+        // Production order (ConfigAgentFactory::build_with_mcp): the client
+        // MCP client connects and registers AFTER finalize. The tool survives.
+        let client = octos_agent::McpClient::start(std::slice::from_ref(&config))
+            .await
+            .expect("client MCP server starts");
+        client.register_tools(&mut after);
+        assert!(
+            after.is_tool_visible("fake_client_tool"),
+            "registering after profile narrowing must keep the client-advertised tool"
+        );
+
+        // The flip side pins WHY the ordering matters: registered before
+        // finalize, the same tool is evicted by the allow-list.
+        let mut before =
+            ToolRegistry::with_builtins_and_sandbox(dir.path(), create_sandbox(&octos_agent::SandboxConfig::default()));
+        let client = octos_agent::McpClient::start(&[config])
+            .await
+            .expect("second client MCP server starts");
+        client.register_tools(&mut before);
+        assert!(before.is_tool_visible("fake_client_tool"));
+        finalize_tool_registry(&mut before, &Config::default(), "openai", "gpt-test", &profile);
+        assert!(
+            !before.is_tool_visible("fake_client_tool"),
+            "a client tool registered before the narrowing would be evicted by the coding allow-list"
+        );
+    }
+
     use agent_client_protocol::schema::ProtocolVersion;
     use octos_agent::SilentReporter;
     use std::time::Duration;
