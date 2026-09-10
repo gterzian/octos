@@ -1,0 +1,9 @@
+{
+  "name": "hosted",
+  "version": 1,
+  "description": "Host-managed agent: zero octos-native tools. The registry is emptied entirely (files, shell, search, memory, spawn, web — everything octos registers itself), so any tool a session can call must be registered by the hosting client after profile narrowing — e.g. the client's ACP `session/new` `mcpServers`, which are added per-session and always survive. Embedding hosts that mediate every tool call themselves (Robrix's AI-room agent) run with this profile so the model only ever sees the host's capability-gated tools.",
+  "tools": {"mode": "none"},
+  "mcp_servers": [],
+  "permissions": "default",
+  "agents": []
+}

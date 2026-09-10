@@ -16,7 +16,8 @@ Options:
   -m, --message <MSG>      Single message (non-interactive)
       --max-iterations <N> Max tool iterations per message (default: 50)
       --profile <NAME>     Runtime tool profile (default: coding — lean
-                           core-coding tools; coding-full = everything)
+                           core-coding tools; coding-full = everything,
+                           hosted = zero octos tools, host-supplied only)
   -v, --verbose            Show tool outputs
       --no-retry           Disable retry
 ```

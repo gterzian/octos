@@ -236,6 +236,7 @@ Built-in profiles:
 | `coding` (default) | **Lean core-coding loop only**: files (`group:fs`), shell (`group:runtime`), search (`group:search`), long-term memory (`group:memory`), `spawn`, `ask_user_question` — ≈15–18 tools, ≈3.3K tokens of schemas per round. Web/research/media/messaging tools, `run_pipeline`, and bundled skills (weather, news, send_email, …) are **excluded**. |
 | `coding-full` | The unfiltered pre-lean surface — every native, bundled-skill, plugin, and MCP tool (≈48 tools, ≈9K tokens per round). Byte-for-byte the old `coding` behaviour. |
 | `swarm` | Coding set plus swarm-coordination tools (`send_to_agent`, `cancel_task`, `relaunch_task`, …). |
+| `hosted` | **Zero octos-native tools.** The registry is emptied entirely, so a session can only call tools the embedding client registered *after* profile narrowing — e.g. the client's ACP `session/new` `mcpServers`. Embedding hosts that mediate every tool call themselves (Robrix's AI-room agent) run the agent with this profile so the model only ever sees the host's capability-gated tools. |
 
 Switching profiles:
 

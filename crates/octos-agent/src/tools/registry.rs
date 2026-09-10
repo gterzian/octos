@@ -876,6 +876,12 @@ impl ToolRegistry {
     /// - [`crate::profile::ProfileTools::DenyList`] — drops tools matching
     ///   any deny list entry (same matching rules). Spawn-only tools are
     ///   likewise preserved.
+    /// - [`crate::profile::ProfileTools::None`] — evicts EVERY tool,
+    ///   including `spawn_only` ones: a host-managed agent (the built-in
+    ///   `hosted` profile) has no background execution of its own. Tools a
+    ///   session may still call — a hosting client's MCP servers from ACP
+    ///   `session/new` `mcpServers` — are registered AFTER this filter and
+    ///   so survive it.
     ///
     /// The filter runs in-place. Cache invalidation is handled by
     /// [`ToolRegistry::retain`]. Intended to be called as a post-build
@@ -921,6 +927,18 @@ impl ToolRegistry {
                             .iter()
                             .any(|entry| policy::entry_matches(entry, name))
                 });
+            }
+            ProfileTools::None => {
+                // Host-managed agent: evict EVERY tool, spawn_only included.
+                // `retain(|_| false)` also prunes the parallel side state
+                // (spawn_only markers, spawn_only_messages, internal_hidden)
+                // for the evicted names, and leaves `mcp_services` alone so
+                // configured MCP transports stay alive even though their
+                // tools are gone (#1886). Anything a session can still call
+                // is registered after this point — a hosting client's MCP
+                // servers are registered per-session, after profile
+                // narrowing, so they survive untouched.
+                self.retain(|_| false);
             }
         }
     }

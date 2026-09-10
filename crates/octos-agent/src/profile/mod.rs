@@ -40,8 +40,12 @@
 //!    (JSON files under `crates/octos-agent/src/assets/profiles/`).
 //!
 //! Today's built-in profiles are `coding` (the lean default), `coding-full`
-//! (the unfiltered pre-lean surface), and `swarm` (an allow-list extension
-//! that enables multi-worker swarm coordination tools).
+//! (the unfiltered pre-lean surface), `swarm` (an allow-list extension
+//! that enables multi-worker swarm coordination tools), and `hosted` (a
+//! host-managed profile with zero octos-native tools — used by embedding
+//! hosts such as Robrix that mediate every tool call themselves and only
+//! want the tools they advertise to the agent through ACP `session/new`
+//! `mcpServers`).
 //!
 //! # Applied vs recorded settings
 //!
@@ -84,6 +88,7 @@ const BUILTIN_PROFILES: &[(&str, &str)] = &[
         include_str!("../assets/profiles/coding-full.json"),
     ),
     ("swarm", include_str!("../assets/profiles/swarm.json")),
+    ("hosted", include_str!("../assets/profiles/hosted.json")),
 ];
 
 /// The source a resolved profile was loaded from. Used by the CLI resolver
@@ -98,8 +103,8 @@ pub enum ProfileSource {
     Builtin,
 }
 
-/// How the profile narrows the tool registry. Mirrors the three modes
-/// called out in the issue scope:
+/// How the profile narrows the tool registry. Mirrors the modes called out
+/// in the issue scope:
 ///
 /// - `default` — no filter; the registry passes through untouched. This is
 ///   what the built-in `coding-full` profile uses so behaviour parity with
@@ -109,9 +114,18 @@ pub enum ProfileSource {
 /// - `deny_list` — every tool survives except the named ones. Useful for
 ///   profiles that strip a single capability (e.g. drop `web_fetch` from
 ///   an otherwise-default set).
+/// - `none` — the registry is emptied entirely: the agent brings no
+///   octos-native tools at all. Tools registered *after* the filter runs —
+///   e.g. a hosting client's MCP servers from ACP `session/new`
+///   `mcpServers` — are the only ones a session can call. Used by the
+///   built-in `hosted` profile, which embedding hosts (Robrix, …) apply
+///   when they mediate every tool call themselves.
 ///
-/// `spawn_only` tools are *never* filtered out regardless of mode — they
-/// carry background-execution wiring that the runtime depends on.
+/// `spawn_only` tools are *never* filtered out in `default`, `allow_list`,
+/// or `deny_list` modes — they carry background-execution wiring that the
+/// runtime depends on. `none` is the deliberate exception: it evicts even
+/// `spawn_only` tools, because a host-managed agent has no background
+/// execution of its own.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ProfileTools {
@@ -131,6 +145,12 @@ pub enum ProfileTools {
         #[serde(default)]
         tools: Vec<String>,
     },
+    /// Zero-tool surface: evicts every registered tool (including
+    /// `spawn_only`) so nothing the agent registered itself is callable.
+    /// Anything a session may still call must be registered after profile
+    /// narrowing — a hosting client's MCP servers are, by construction.
+    #[serde(rename = "none")]
+    None,
 }
 
 impl ProfileTools {
@@ -143,7 +163,8 @@ impl ProfileTools {
     /// spawn_only tool is registered it can never be evicted by the
     /// filter, so bootstrap sites (chat/acp `run_pipeline`) consult this
     /// predicate FIRST and skip registration when the profile excludes
-    /// the tool.
+    /// the tool. `none` always says no: no octos-native tool is ever
+    /// worth registering under a host-managed profile.
     pub fn allows(&self, tool_name: &str) -> bool {
         use crate::tools::policy::entry_matches;
         match self {
@@ -155,6 +176,7 @@ impl ProfileTools {
                 tools.is_empty() || tools.iter().any(|entry| entry_matches(entry, tool_name))
             }
             Self::DenyList { tools } => !tools.iter().any(|entry| entry_matches(entry, tool_name)),
+            Self::None => false,
         }
     }
 }
@@ -862,6 +884,86 @@ mod tests {
         assert!(!coding.tools.allows("run_pipeline"));
         let full = ProfileDefinition::builtin("coding-full").expect("coding-full");
         assert!(full.tools.allows("run_pipeline"));
+    }
+
+    #[test]
+    fn should_load_builtin_hosted_profile_as_zero_tool_surface() {
+        let hosted = ProfileDefinition::builtin("hosted").expect("hosted builtin");
+        hosted.validate().expect("valid");
+        assert_eq!(hosted.name, "hosted");
+        // The whole point of the hosted profile: NO tool filter mode other
+        // than `none` can express "evict everything" — empty allow lists
+        // are a pass-through-with-warning and deny lists can never remove
+        // spawn_only tools. `none` is the deliberate zero-tool surface.
+        assert!(
+            matches!(hosted.tools, ProfileTools::None),
+            "hosted must declare the zero-tool mode, got {:?}",
+            hosted.tools,
+        );
+        // `allows()` agrees with the filter for every native tool, so the
+        // chat/acp bootstrap gates never register spawn_only tools the
+        // filter would otherwise be forced to keep.
+        assert!(!hosted.tools.allows("shell"));
+        assert!(!hosted.tools.allows("read_file"));
+        assert!(!hosted.tools.allows("run_pipeline"));
+        assert!(!hosted.tools.allows("spawn"));
+        // No sub-agents preloaded: a host-managed agent does not delegate.
+        assert!(hosted.agents.is_empty());
+        assert!(ProfileDefinition::builtin_ids().contains(&"hosted"));
+    }
+
+    #[test]
+    fn should_parse_none_mode_as_zero_tool_surface() {
+        let json = r#"{"name": "hosted", "version": 1, "tools": {"mode": "none"}}"#;
+        let def = ProfileDefinition::from_json_str(json).expect("parse");
+        assert!(matches!(def.tools, ProfileTools::None));
+        // Round-trips through JSON so a profile file can be authored by
+        // hand and read back by the loader.
+        let text = serde_json::to_string(&def).expect("serialize");
+        let round = ProfileDefinition::from_json_str(&text).expect("deserialize");
+        assert_eq!(round.tools, def.tools);
+    }
+
+    #[test]
+    fn hosted_profile_empties_registry_including_spawn_only_tools() {
+        // The registry narrowing is the enforcement side of the hosted
+        // profile: everything octos registered itself — builtins, config/
+        // plugin MCP tools, skills, spawn_only tools — is evicted, so the
+        // model can only see what the host registers afterwards.
+        let mut tools = ToolRegistry::new();
+        tools.register(StubTool { name: "read_file" });
+        tools.register(StubTool { name: "shell" });
+        // A spawn_only tool (the registry carve-out that survives every
+        // allow/deny list) must NOT survive `none`.
+        tools.register(StubTool {
+            name: "run_pipeline",
+        });
+        tools.mark_spawn_only("run_pipeline", None);
+        // Skill / plugin tools register before profile narrowing too.
+        tools.register(StubTool {
+            name: "get_weather",
+        });
+
+        let hosted = ProfileDefinition::builtin("hosted").expect("hosted");
+        hosted.apply_to_registry(&mut tools);
+
+        assert!(
+            tools.specs().is_empty(),
+            "hosted profile must evict every octos-native tool, got {:?}",
+            tools
+                .specs()
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>(),
+        );
+
+        // Tools registered AFTER narrowing — the hosting client's MCP
+        // servers, added per-session in the ACP path — survive untouched.
+        tools.register(StubTool {
+            name: "send_message",
+        });
+        let names: Vec<String> = tools.specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["send_message".to_string()]);
     }
 
     #[test]

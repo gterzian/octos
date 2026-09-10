@@ -144,6 +144,15 @@ impl ToolPermissions {
             ProfileTools::DenyList { tools } => {
                 denied = expand_profile_tool_entries(tools);
             }
+            ProfileTools::None => {
+                // Host-managed profile: the registry itself is emptied by
+                // `filter_by_profile`, and the runtime envelope agrees by
+                // fail-closing — an empty allow list denies every name, so
+                // a native tool that somehow reaches the call boundary
+                // (and consults the envelope) is never permitted. Host
+                // MCP tools are not gated by this record.
+                allowed = Some(HashSet::new());
+            }
         }
         Self {
             mode: profile.permissions,
@@ -2298,6 +2307,19 @@ mod tool_context_tests {
         let profile = make_profile("empty-allow", ProfileTools::AllowList { tools: Vec::new() });
         let permissions = ToolPermissions::from_profile(&profile);
         assert!(permissions.is_tool_allowed("anything"));
+    }
+
+    #[test]
+    fn should_deny_everything_when_profile_uses_none_mode() {
+        // `none` (the built-in `hosted` profile) empties the registry AND
+        // fail-closes the runtime envelope: a native tool that somehow
+        // reaches the call boundary and consults the envelope is never
+        // permitted. Host MCP tools are not gated by this record.
+        let profile = make_profile("hosted", ProfileTools::None);
+        let permissions = ToolPermissions::from_profile(&profile);
+        assert!(!permissions.is_tool_allowed("read_file"));
+        assert!(!permissions.is_tool_allowed("shell"));
+        assert!(!permissions.is_tool_allowed("anything_else"));
     }
 
     #[test]

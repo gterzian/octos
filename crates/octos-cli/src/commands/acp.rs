@@ -51,6 +51,33 @@
 //! Permissions: octos runs its own tools through its own approval path; we
 //! surface them to the client as ACP `tool_call` / `tool_call_update` records
 //! but do not block on ACP `session/request_permission` in v1.
+//!
+//! ## Host notifications: `session/notify` (Robrix P3)
+//!
+//! The ACP surface has one direction tools do not cover: tools are
+//! agent→host, so pushing *events about the host* INTO a live session (a
+//! granted permission, a tool denial, a build finishing, a new message in an
+//! allowlisted room) needs its own client→agent request. ACP v1.2.0 has no
+//! standard message for it, so octos registers a custom request — the
+//! `agent-client-protocol` builder dispatches by Rust type, and the derive
+//! macros (`JsonRpcRequest`/`JsonRpcResponse`) let us register an octos-local
+//! request type next to the spec types without forking the crate:
+//!
+//! ```text
+//! session/notify
+//! { "session_id": "…", "events": ["…"],
+//!   "auto_respond": false, "if_busy": "drop" }
+//! → { "queued": true, "busy": false }
+//! ```
+//!
+//! The handler acks immediately (never blocks on the LLM) and appends the
+//! events to the session's history as `MessageRole::System` rows — stored and
+//! replayed distinctly, never as a `user` turn, so nothing a client reads
+//! back via `session/load` can render a notification as the user having said
+//! it. `auto_respond: true` starts a turn on an idle session through the
+//! exact same spawned-task path a `session/prompt` uses (same reporter, same
+//! cancellation flag); `if_busy` controls what happens when a turn is in
+//! flight: `drop` discards, `fold` queues (bounded) for the next turn.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -71,9 +98,11 @@ use agent_client_protocol::{
     Agent as AcpAgentRole, Client, ConnectionTo, Error as AcpError, Stdio, on_receive_notification,
     on_receive_request,
 };
+use serde::{Deserialize, Serialize};
 
 use octos_agent::{
-    Agent, AgentConfig, ProgressEvent, ProgressReporter, ToolRegistry, create_sandbox,
+    Agent, AgentConfig, ConversationResponse, ProgressEvent, ProgressReporter, ToolRegistry,
+    create_sandbox,
 };
 use octos_core::{AgentId, SessionScope, canonicalize_skill_read_zones};
 use octos_llm::{EmbeddingProvider, LlmProvider};
@@ -85,6 +114,88 @@ use octos_core::SessionKey;
 
 use super::Executable;
 use crate::config::Config;
+
+/// Cap on event lines retained by the `if_busy: "fold"` queue. Mirrors
+/// Robrix's own bounded queued-prompt cap: a busy agent is mid-turn on older
+/// context, so stale notifications beyond this are worse than none — the
+/// oldest are dropped first.
+const FOLD_QUEUE_MAX_EVENTS: usize = 16;
+
+/// The synthesized "user" instruction handed to the model when
+/// `session/notify` starts a turn with `auto_respond: true`. Deliberately
+/// explicit that the events are context, not speech: the agent must act if
+/// appropriate and otherwise stay silent (Robrix drops empty replies).
+/// This text is never persisted — the turn's user row is excluded from
+/// history so a later `session/load` cannot render it as the user speaking.
+const AUTO_RESPOND_INSTRUCTION: &str = "Host notifications were just delivered to you (the [Notification] rows \
+     in your context). Review them and act if appropriate — continue a task \
+     whose prerequisite you were told just finished, or comment on newly \
+     available information. These notifications are NOT user messages: do \
+     not answer them as if a user spoke, and do not fabricate or paraphrase \
+     a user request. If nothing warrants action, reply with no text at all.";
+
+/// What a `session/notify` request does when the session has a turn in
+/// flight (`busy`). Wire values: `"drop"` (default) discards the events;
+/// `"fold"` queues them (bounded, oldest first) and injects them before the
+/// next turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyIfBusy {
+    /// Discard the events: a busy agent is mid-turn on older context, and
+    /// stale notifications are worse than none.
+    #[default]
+    Drop,
+    /// Queue the events (bounded) and inject them before the next turn.
+    Fold,
+}
+
+/// Client→agent `session/notify` request: push host event/notification
+/// context into a live session WITHOUT it being (or being mistakable for) a
+/// user turn.
+///
+/// Not part of the ACP spec — an octos extension for embedding hosts (Robrix
+/// AI Rooms) that need to tell an agent about room events. Registered via the
+/// `agent-client-protocol` request derives so the JSON-RPC runtime dispatches
+/// it exactly like a spec request.
+///
+/// Wire shape (snake_case, matching the embedding contract):
+/// ```text
+/// { "session_id": "…", "events": ["…"],
+///   "auto_respond": false, "if_busy": "drop" }
+/// ```
+/// `sessionId` is also accepted as an alias for ACP-convention clients.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "session/notify", response = NotifyResponse)]
+#[serde(rename_all = "snake_case")]
+pub struct NotifyRequest {
+    /// The session to notify.
+    #[serde(alias = "sessionId")]
+    pub session_id: SessionId,
+    /// One or more plain-text event descriptions, already human-readable
+    /// ("Message edited in Design chat", "read_room_messages was denied: …").
+    pub events: Vec<String>,
+    /// `false` (default): context only — the agent does nothing until the
+    /// next user prompt. `true`: on an idle session, start a turn exactly as
+    /// if a prompt had arrived, with the events as context.
+    #[serde(default)]
+    pub auto_respond: bool,
+    /// What to do when a turn is in flight. `"drop"` (default) or `"fold"`.
+    #[serde(default)]
+    pub if_busy: NotifyIfBusy,
+}
+
+/// Acknowledgment for [`NotifyRequest`]. Sent immediately, before any LLM
+/// work; `queued` is `false` only when the events were discarded
+/// (`busy` + `if_busy: drop`).
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+#[serde(rename_all = "snake_case")]
+pub struct NotifyResponse {
+    /// Whether the events were accepted (stored now, or queued for the next
+    /// turn). `false` means they were discarded under `if_busy: drop`.
+    pub queued: bool,
+    /// Whether a turn was in flight when the request was handled.
+    pub busy: bool,
+}
 
 /// Default for [`AcpCommand::max_iterations`]. Shared by the clap default and
 /// the `Default` impl so an embedder building the command by hand gets the same
@@ -137,10 +248,12 @@ pub struct AcpCommand {
     pub max_iterations: u32,
 
     /// Runtime profile to apply at startup (parity with `octos chat`).
-    /// Accepts a built-in name (`coding`, `coding-full`, `swarm`), a
-    /// user-dir id under `~/.octos/profiles/<id>/`, or a path. Defaults to
+    /// Accepts a built-in name (`coding`, `coding-full`, `swarm`, `hosted`),
+    /// a user-dir id under `~/.octos/profiles/<id>/`, or a path. Defaults to
     /// `coding`, the lean core-coding tool surface; use `coding-full` for
-    /// the unfiltered pre-lean tool set.
+    /// the unfiltered pre-lean tool set, or `hosted` for a host-managed
+    /// agent with zero octos-native tools (everything it can call comes
+    /// from the client's ACP `mcpServers`).
     #[arg(long)]
     pub profile: Option<String>,
 }
@@ -192,6 +305,20 @@ struct AcpSession {
     /// Flipped to `true` by a `session/cancel` notification; the agent's
     /// shutdown flag is shared so the in-flight loop aborts.
     shutdown: Arc<AtomicBool>,
+    /// Number of turns (prompts and `auto_respond` notify turns) currently in
+    /// flight for this session. `session/notify` reads it as `busy`. A counter
+    /// rather than a bool so two pathological overlapping prompts on one
+    /// session cannot clear the flag while the other turn is still running.
+    /// Incremented synchronously on the dispatch loop before a turn is
+    /// spawned (see `handle_prompt` / `handle_notify`) so a notify dispatched
+    /// right after sees `busy` truthfully; decremented when the spawned turn
+    /// task finishes its persistence.
+    active_turns: std::sync::atomic::AtomicUsize,
+    /// Host-event lines queued by `session/notify` with `if_busy: "fold"`
+    /// while a turn was running, oldest first, bounded to
+    /// [`FOLD_QUEUE_MAX_EVENTS`]. Drained into `history` (as System rows) at
+    /// the start of the next turn — see `append_host_events`.
+    fold_queue: Mutex<Vec<String>>,
 }
 
 /// Builds a fresh octos [`Agent`] per ACP `session/new`.
@@ -974,6 +1101,7 @@ async fn spawn_acp_agent(
     let factory_for_load = factory.clone();
     let sessions_for_load = sessions.clone();
     let sessions_for_prompt = sessions.clone();
+    let sessions_for_notify = sessions.clone();
     let sessions_for_cancel = sessions;
 
     AcpAgentRole
@@ -1030,6 +1158,18 @@ async fn spawn_acp_agent(
                         responder: agent_client_protocol::Responder<PromptResponse>,
                         cx: ConnectionTo<Client>| {
                 handle_prompt(&sessions_for_prompt, req, cx, responder)
+            },
+            on_receive_request!(),
+        )
+        // session/notify (octos extension, Robrix P3): push host events into a
+        // live session as context, never as a user turn. Acks immediately;
+        // `auto_respond` starts a turn through the same spawned-task path a
+        // prompt uses.
+        .on_receive_request(
+            async move |req: NotifyRequest,
+                        responder: agent_client_protocol::Responder<NotifyResponse>,
+                        cx: ConnectionTo<Client>| {
+                handle_notify(&sessions_for_notify, req, cx, responder).await
             },
             on_receive_request!(),
         )
@@ -1383,6 +1523,8 @@ async fn handle_new_session(
         session_store: factory.session_store(),
         history: Mutex::new(Vec::new()),
         shutdown,
+        active_turns: std::sync::atomic::AtomicUsize::new(0),
+        fold_queue: Mutex::new(Vec::new()),
     });
     sessions.lock().await.insert(session_id.clone(), session);
 
@@ -1437,8 +1579,293 @@ fn handle_prompt(
     // spawned task) guarantees a later cancel's `store(true)` is not clobbered.
     session.shutdown.store(false, Ordering::Release);
 
-    cx.clone()
-        .spawn(run_prompt_turn(session, req, cx, responder))
+    // Mark the session busy while the turn runs so `session/notify` can report
+    // `busy` truthfully and apply `if_busy`. Incremented synchronously here
+    // (the dispatch loop cannot process a racing notify until this handler
+    // returns) and decremented by the spawned task once the turn's persistence
+    // is done — see `run_prompt_turn`. A counter, not a bool: two overlapping
+    // prompts on one session must not clear busy while the other still runs.
+    let session_for_flag = session.clone();
+    let spawn = cx
+        .clone()
+        .spawn(run_prompt_turn(session, req, cx, responder));
+    if spawn.is_ok() {
+        session_for_flag.active_turns.fetch_add(1, Ordering::AcqRel);
+    }
+    spawn
+}
+
+/// Handle `session/notify` (octos extension — see the module docs): push host
+/// event context into a live session without it being (or being mistakable
+/// for) a user turn.
+///
+/// The JSON-RPC response is the acknowledgement `{queued, busy}`, sent
+/// immediately — this handler never waits on the LLM. Semantics:
+/// - idle: the events are appended to the session's history as
+///   `MessageRole::System` rows and persisted, so the model sees them on the
+///   next turn and they survive a `session/load`/`session/resume` cycle;
+///   `auto_respond: true` additionally starts a turn on the spot, through the
+///   exact spawned-task path `session/prompt` uses (same reporter, same
+///   cancellation flag, same persistence).
+/// - busy + `if_busy: drop`: events discarded (`queued: false`).
+/// - busy + `if_busy: fold`: events queued (bounded, oldest dropped) and
+///   injected before the next turn.
+///
+/// Unknown session ids are an error (a notify for a session this process has
+/// never seen cannot be queued anywhere).
+async fn handle_notify(
+    sessions: &SessionMap,
+    req: NotifyRequest,
+    cx: ConnectionTo<Client>,
+    responder: agent_client_protocol::Responder<NotifyResponse>,
+) -> std::result::Result<(), AcpError> {
+    // Look up the session synchronously; a contended map falls back to a
+    // deferred handler inside a spawned task, mirroring `handle_prompt`.
+    let session = {
+        let map = match sessions.try_lock() {
+            Ok(map) => map,
+            Err(_) => {
+                let sessions = sessions.clone();
+                let session_id = req.session_id.clone();
+                return cx.clone().spawn(handle_notify_deferred(
+                    sessions, session_id, req, cx, responder,
+                ));
+            }
+        };
+        map.get(&req.session_id).cloned()
+    };
+
+    let Some(session) = session else {
+        return responder.respond_with_error(agent_client_protocol::util::internal_error(format!(
+            "unknown session id: {}",
+            req.session_id.0
+        )));
+    };
+
+    handle_notify_on_session(&session, req, cx, responder).await
+}
+
+/// Resolve the session from the map inside the spawned task (used only when
+/// the session map was contended at handler time), then handle the notify.
+async fn handle_notify_deferred(
+    sessions: SessionMap,
+    session_id: SessionId,
+    req: NotifyRequest,
+    cx: ConnectionTo<Client>,
+    responder: agent_client_protocol::Responder<NotifyResponse>,
+) -> std::result::Result<(), AcpError> {
+    let session = {
+        let map = sessions.lock().await;
+        map.get(&session_id).cloned()
+    };
+    match session {
+        Some(session) => handle_notify_on_session(&session, req, cx, responder).await,
+        None => responder.respond_with_error(agent_client_protocol::util::internal_error(format!(
+            "unknown session id: {}",
+            session_id.0
+        ))),
+    }
+}
+
+/// The actual `session/notify` work, once the session is resolved: apply the
+/// busy/drop/fold semantics, store (or queue) the events, and optionally start
+/// an `auto_respond` turn. Answers the request with the ack `{queued, busy}`.
+async fn handle_notify_on_session(
+    session: &Arc<AcpSession>,
+    req: NotifyRequest,
+    cx: ConnectionTo<Client>,
+    responder: agent_client_protocol::Responder<NotifyResponse>,
+) -> std::result::Result<(), AcpError> {
+    if req.events.is_empty() {
+        return responder.respond_with_error(agent_client_protocol::util::internal_error(
+            "session/notify requires at least one event",
+        ));
+    }
+
+    let busy = session.active_turns.load(Ordering::Acquire) != 0;
+
+    if busy {
+        // A turn is mid-flight on older context; stale notifications are worse
+        // than none. `drop` discards; `fold` queues for the next turn.
+        match req.if_busy {
+            NotifyIfBusy::Drop => {
+                tracing::debug!(
+                    session_id = %req.session_id.0,
+                    events = req.events.len(),
+                    "session/notify while busy; if_busy=drop discarding the events"
+                );
+                return responder.respond(NotifyResponse {
+                    queued: false,
+                    busy: true,
+                });
+            }
+            NotifyIfBusy::Fold => {
+                queue_fold_events(session, &req.events).await;
+                tracing::info!(
+                    session_id = %req.session_id.0,
+                    events = req.events.len(),
+                    "session/notify while busy; if_busy=fold queued the events for the next turn"
+                );
+                return responder.respond(NotifyResponse {
+                    queued: true,
+                    busy: true,
+                });
+            }
+        }
+    }
+
+    // Idle: the events are context now. Append (and persist) them as System
+    // rows so the model reads them as facts about its environment on the next
+    // turn — and so they survive a session/load + resume. Fold-queued events
+    // from an earlier busy window are drained first so history stays ordered.
+    let folded = drain_fold_events(session).await;
+    let mut events = folded;
+    events.extend(req.events.iter().cloned());
+    append_host_events(session, &events).await;
+
+    // auto_respond: start a turn exactly as if a prompt had arrived. Same
+    // rules as `handle_prompt`: reset the stale cancel flag synchronously,
+    // mark busy, spawn the turn task (which streams `session/update` via its
+    // own reporter). The ack below is unaffected — it fires immediately.
+    if req.auto_respond {
+        session.shutdown.store(false, Ordering::Release);
+        let session_for_flag = session.clone();
+        let sid = req.session_id.clone();
+        let spawn = cx
+            .clone()
+            .spawn(run_auto_respond_turn(session.clone(), sid, cx));
+        if spawn.is_ok() {
+            session_for_flag.active_turns.fetch_add(1, Ordering::AcqRel);
+        } else {
+            return spawn;
+        }
+    }
+
+    responder.respond(NotifyResponse {
+        queued: true,
+        busy: false,
+    })
+}
+
+/// Queue host-event lines for later injection (`if_busy: fold`), dropping the
+/// oldest lines past [`FOLD_QUEUE_MAX_EVENTS`].
+async fn queue_fold_events(session: &Arc<AcpSession>, events: &[String]) {
+    let mut queue = session.fold_queue.lock().await;
+    queue.extend(events.iter().cloned());
+    if queue.len() > FOLD_QUEUE_MAX_EVENTS {
+        let excess = queue.len() - FOLD_QUEUE_MAX_EVENTS;
+        let dropped = queue.drain(..excess).count();
+        tracing::debug!(
+            dropped,
+            cap = FOLD_QUEUE_MAX_EVENTS,
+            "session/notify fold queue full; dropped the oldest events"
+        );
+    }
+}
+
+/// Take everything currently in the fold queue (oldest first), emptying it.
+async fn drain_fold_events(session: &AcpSession) -> Vec<String> {
+    let mut queue = session.fold_queue.lock().await;
+    std::mem::take(&mut *queue)
+}
+
+/// Append host-event lines to the session's history as `MessageRole::System`
+/// rows — stored and replayed distinctly, NEVER as a `user` turn — and persist
+/// them so they survive a `session/load`+`session/resume` cycle.
+///
+/// System rows need no thread id (`derive_thread_id_for_new_write` returns
+/// `Ok(None)` for System), so the store write is direct. Each event is one
+/// row so the transcript stays granular; the `[Notification]` prefix makes the
+/// origin explicit to the model and to anyone inspecting the stored JSONL.
+async fn append_host_events(session: &AcpSession, events: &[String]) {
+    if events.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now();
+    let rows: Vec<octos_core::Message> = events
+        .iter()
+        .map(|event| octos_core::Message {
+            role: octos_core::MessageRole::System,
+            content: format!("[Notification] {event}"),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: now,
+        })
+        .collect();
+
+    {
+        let mut h = session.history.lock().await;
+        h.extend(rows.iter().cloned());
+    }
+
+    if let Some(store) = session.session_store.as_ref() {
+        let mut guard = store.lock().await;
+        for message in rows {
+            // Carry on rather than break: the rows are independent.
+            if let Err(e) = guard.add_message(&session.session_key, message).await {
+                tracing::warn!(
+                    error = %e,
+                    session = %session.session_key.0,
+                    "failed to persist a host notification; it will not survive a restart"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        session = %session.session_key.0,
+        events = events.len(),
+        "appended host notifications to the session context (system role)"
+    );
+}
+
+/// `session/notify` with `auto_respond: true`: the spawned turn task. Shares
+/// [`run_turn_core`] with `session/prompt`, so streaming, cancellation, tool
+/// calls and MCP behave identically; the only differences are that the turn's
+/// instruction is the synthesized [`AUTO_RESPOND_INSTRUCTION`] (its user row
+/// is never persisted) and that there is no JSON-RPC response to send — the
+/// `session/notify` request was already acked, so the turn's outcome is
+/// observed through the `session/update` stream.
+async fn run_auto_respond_turn(
+    session: Arc<AcpSession>,
+    session_id: SessionId,
+    cx: ConnectionTo<Client>,
+) -> std::result::Result<(), AcpError> {
+    let end = run_turn_core(
+        &session,
+        &session_id,
+        AUTO_RESPOND_INSTRUCTION,
+        /* synthetic_user_row */ true,
+        &cx,
+    )
+    .await;
+    session.active_turns.fetch_sub(1, Ordering::AcqRel);
+
+    // No responder: the notify request was acked when the turn was accepted.
+    // Log the outcome; a failed turn must not take the connection down (the
+    // caller that started the turn observes it via the update stream).
+    match end {
+        TurnEnd::Done(reason) => {
+            tracing::info!(
+                session_id = %session_id.0,
+                stop_reason = ?reason,
+                "auto_respond turn finished"
+            );
+            Ok(())
+        }
+        TurnEnd::Failed(message) => {
+            tracing::error!(
+                session_id = %session_id.0,
+                error = %message,
+                "auto_respond turn failed"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Resolve the session from the map inside the spawned task (used only when the
@@ -1464,6 +1891,13 @@ async fn run_prompt_turn_deferred(
             // clobbered. Best-effort for the contended path; the common path
             // (`handle_prompt`) resets synchronously and closes the race.
             session.shutdown.store(false, Ordering::Release);
+            // Busy accounting normally happens synchronously in `handle_prompt`
+            // before the spawn; here the session is only resolved inside this
+            // task, so the increment happens now. Tiny window: a
+            // `session/notify` dispatched between the spawn and this increment
+            // sees `busy: false` and stores its events idle-style — harmless
+            // (they land in history and reach the model this turn or next).
+            session.active_turns.fetch_add(1, Ordering::AcqRel);
             run_prompt_turn(session, req, cx, responder).await
         }
         None => responder.respond_with_error(agent_client_protocol::util::internal_error(format!(
@@ -1475,6 +1909,11 @@ async fn run_prompt_turn_deferred(
 
 /// The actual prompt turn: attach a streaming reporter, run the octos agent
 /// loop, persist history, and respond with the ACP stop reason.
+///
+/// Spawned off the dispatch loop by [`handle_prompt`] (or run directly by the
+/// rare deferred path); shares [`run_turn_core`] with the `auto_respond`
+/// notify turns so both go through one code path for cancellation, streaming,
+/// tool calls and persistence.
 async fn run_prompt_turn(
     session: Arc<AcpSession>,
     req: PromptRequest,
@@ -1487,159 +1926,243 @@ async fn run_prompt_turn(
     // is spawned, so a `session/cancel` dispatched for this turn correctly wins
     // instead of being clobbered by a reset in this spawned task.
     let user_text = extract_prompt_text(&req.prompt);
+    let end = run_turn_core(&session, &req.session_id, &user_text, false, &cx).await;
+
+    // The turn is no longer in flight: its history writes are done. Clear busy
+    // so a `session/notify` arriving while the response frame is being sent
+    // sees the idle state and stores its events for the NEXT turn (they cannot
+    // reach this one — its context was already assembled).
+    session.active_turns.fetch_sub(1, Ordering::AcqRel);
+
+    match end {
+        TurnEnd::Done(stop_reason) => responder.respond(PromptResponse::new(stop_reason)),
+        TurnEnd::Failed(message) => {
+            responder.respond_with_error(agent_client_protocol::util::internal_error(message))
+        }
+    }
+}
+
+/// How a turn ended. Split out so the prompt and `auto_respond` paths share
+/// the exact same agent-loop + persistence code while differing only in what
+/// they do with the outcome (report it on the request, or log it).
+enum TurnEnd {
+    /// The agent loop finished (naturally, or cancelled); report this reason.
+    Done(StopReason),
+    /// The loop failed for a reason other than cancellation; surface the error.
+    Failed(String),
+}
+
+/// The shared core of every turn (`session/prompt` and `session/notify` with
+/// `auto_respond`): inject fold-queued host events, attach a streaming
+/// reporter, run the octos agent loop, persist the turn's rows, and report
+/// how it ended.
+///
+/// `synthetic_user_row` marks an `auto_respond` turn whose user row is the
+/// synthesized [`AUTO_RESPOND_INSTRUCTION`]: that row is never persisted, so a
+/// later `session/load` can never replay it as the user having spoken.
+async fn run_turn_core(
+    session: &Arc<AcpSession>,
+    session_id: &SessionId,
+    user_text: &str,
+    synthetic_user_row: bool,
+    cx: &ConnectionTo<Client>,
+) -> TurnEnd {
+    // Fold-queued host events (`session/notify` with `if_busy: fold` while a
+    // turn was running) are injected before THIS turn reads history — this is
+    // "the next turn". Idle notifies append their events directly in
+    // `handle_notify_on_session`; the drain here catches folds that a plain
+    // prompt turn arrives to pick up.
+    let folded = drain_fold_events(session).await;
+    if !folded.is_empty() {
+        append_host_events(session, &folded).await;
+    }
+
     let history = { session.history.lock().await.clone() };
 
     // Attach a per-turn reporter that streams `session/update` to this client.
     // `set_reporter` takes `&self` (RwLock interior mutability) precisely so the
     // agent can stay behind an `Arc` across turns.
     let reporter: Arc<dyn ProgressReporter> =
-        Arc::new(AcpProgressReporter::new(req.session_id.clone(), cx));
+        Arc::new(AcpProgressReporter::new(session_id.clone(), cx.clone()));
     session.agent.set_reporter(reporter);
 
     let outcome = session
         .agent
-        .process_message(&user_text, &history, vec![])
+        .process_message(user_text, &history, vec![])
         .await;
 
     let cancelled = session.shutdown.load(Ordering::Acquire);
-    let response = match outcome {
+
+    match outcome {
         Ok(resp) => {
-            // Persist this turn's messages (user + assistant + tool messages).
-            // `ConversationResponse.messages` is THIS-TURN-ONLY (the user
-            // message at front + the assistant/tool messages produced this
-            // turn); it does NOT include prior history. The stored history
-            // still holds the earlier turns (we only cloned it above, never
-            // cleared it), so APPEND — replacing would drop every earlier turn
-            // and the agent would forget context after the second prompt.
-            // Captured under the same guard that appends, not re-read afterwards.
-            //
-            // Taking the index here and re-locking later to slice from it let two
-            // turns interleaving on one session compute overlapping ranges and
-            // write the same messages twice. Holding one guard across append and
-            // capture means each turn takes exactly the rows it appended.
-            let fresh: Vec<octos_core::Message>;
-            {
-                let mut h = session.history.lock().await;
-                let persisted_upto = h.len();
-                let assistant_reply = resp.content.clone();
-                h.extend(resp.messages);
-                // For a plain-text turn, `resp.messages` carries the user row but
-                // NOT the final assistant text (that is streamed live via
-                // `content`). Persist it explicitly so later prompts can refer
-                // back to what the agent SAID — mirroring the chat REPL, which
-                // also pushes `response.content` as an assistant message. Guard
-                // against double-append for turns where messages already ends
-                // with that assistant reply. Skip entirely on a CANCELLED turn:
-                // `content` there is a partial/aborted stream, and persisting it
-                // would condition the next prompt on a reply the client never
-                // completed.
-                let already_persisted = matches!(
-                    h.last(),
-                    Some(last) if last.role == octos_core::MessageRole::Assistant && last.content == assistant_reply
-                );
-                #[allow(clippy::needless_late_init)]
-                if !cancelled && !assistant_reply.is_empty() && !already_persisted {
-                    h.push(octos_core::Message {
-                        role: octos_core::MessageRole::Assistant,
-                        content: assistant_reply,
-                        media: vec![],
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                        client_message_id: None,
-                        thread_id: None,
-                        timestamp: chrono::Utc::now(),
-                    });
-                }
-                fresh = h
-                    .get(persisted_upto..)
-                    .map(<[_]>::to_vec)
-                    .unwrap_or_default();
-            }
-
-            // Write this turn through to the store so it outlives the process.
-            //
-            // Everything above only mutated an in-memory Vec, which is why a kill -9 left
-            // the agent with no idea what it had been doing while the fleet reported it
-            // healthy. Only what this turn added is written: the store appends, so
-            // re-sending earlier turns would duplicate them.
-            //
-            // A store failure is logged, never fatal — losing persistence must not also
-            // lose the turn the agent just completed.
-            if let Some(store) = session.session_store.as_ref() {
-                if !fresh.is_empty() {
-                    // Every message this turn produced shares one thread id.
-                    //
-                    // The store is fail-closed for Assistant and Tool rows:
-                    // derive_thread_id_for_new_write rejects them outright unless the
-                    // caller has stamped the originating turn's thread_id, because a
-                    // derived one picked the wrong sibling user under rapid-fire
-                    // turns. Unstamped, the user row persisted and the assistant row
-                    // was rejected — a stored conversation with the answers missing,
-                    // which is worse than none.
-                    let turn_thread = fresh
-                        .iter()
-                        .find(|m| matches!(m.role, octos_core::MessageRole::User))
-                        .and_then(|m| m.thread_id.clone().or_else(|| m.client_message_id.clone()))
-                        .unwrap_or_else(|| {
-                            // No user row to inherit from, so there is nothing to
-                            // stamp these rows onto. Minting an id keeps the write
-                            // fail-OPEN rather than dropping the turn, but it
-                            // creates exactly the orphan the store's fail-closed
-                            // check exists to prevent: assistant/tool rows in a
-                            // thread containing no user message. Expected to be
-                            // unreachable — say so out loud rather than silently
-                            // converting "we do not know the thread" into
-                            // "invent one", which is what made the original
-                            // thread-id bug so expensive to find.
-                            let minted = uuid::Uuid::now_v7().to_string();
-                            tracing::warn!(
-                                thread_id = %minted,
-                                rows = fresh.len(),
-                                "ACP turn produced no user row; persisting its \
-                                 messages under a MINTED thread id — they will \
-                                 load as a thread with no user message"
-                            );
-                            minted
-                        });
-
-                    let mut guard = store.lock().await;
-                    for mut message in fresh {
-                        if message.thread_id.is_none() {
-                            message.thread_id = Some(turn_thread.clone());
-                        }
-                        // Carry on rather than break: the rows are independent, and
-                        // dropping the rest because one failed loses more than it saves.
-                        if let Err(e) = guard.add_message(&session.session_key, message).await {
-                            tracing::warn!(
-                                error = %e, session = %session.session_key.0,
-                                "failed to persist an ACP message; it will not survive a restart"
-                            );
-                        }
-                    }
-                }
-            }
-            // Distinguish a client-driven cancel from a natural end-of-turn.
-            let stop_reason = if cancelled {
+            persist_turn_rows(session, resp, cancelled, synthetic_user_row).await;
+            TurnEnd::Done(if cancelled {
                 StopReason::Cancelled
             } else {
                 StopReason::EndTurn
-            };
-            PromptResponse::new(stop_reason)
+            })
         }
         Err(err) => {
             // If the turn ended because we were cancelled, report Cancelled
             // rather than surfacing an error frame.
             if cancelled {
-                PromptResponse::new(StopReason::Cancelled)
+                TurnEnd::Done(StopReason::Cancelled)
             } else {
-                return responder.respond_with_error(agent_client_protocol::util::internal_error(
-                    format!("prompt turn failed: {err}"),
-                ));
+                TurnEnd::Failed(format!("prompt turn failed: {err}"))
             }
         }
-    };
-    responder.respond(response)
+    }
+}
+
+/// Persist one finished turn into the session's in-memory history and (when a
+/// store is attached) the session store.
+///
+/// `ConversationResponse.messages` is THIS-TURN-ONLY (the user message at
+/// front + the assistant/tool messages produced this turn); it does NOT
+/// include prior history. The stored history still holds the earlier turns
+/// (each turn clones it, never clears it), so APPEND — replacing would drop
+/// every earlier turn and the agent would forget context after the second
+/// prompt. Fresh rows are captured under the same guard that appends, not
+/// re-read afterwards: taking the index here and re-locking later to slice
+/// from it would let two turns interleaving on one session compute overlapping
+/// ranges and write the same messages twice. One guard across append and
+/// capture means each turn takes exactly the rows it appended.
+///
+/// `synthetic_user_row` (auto_respond turns): the turn's user row is the
+/// synthesized instruction, not the user's words — it is excluded from both
+/// the in-memory history and the store so nothing can render it as the user
+/// having spoken.
+async fn persist_turn_rows(
+    session: &AcpSession,
+    resp: ConversationResponse,
+    cancelled: bool,
+    synthetic_user_row: bool,
+) {
+    let mut turn_rows = resp.messages;
+    if synthetic_user_row {
+        turn_rows.retain(|m| m.role != octos_core::MessageRole::User);
+    }
+    let fresh: Vec<octos_core::Message>;
+    {
+        let mut h = session.history.lock().await;
+        let persisted_upto = h.len();
+        let assistant_reply = resp.content.clone();
+        h.extend(turn_rows);
+        // For a plain-text turn, `resp.messages` carries the user row but
+        // NOT the final assistant text (that is streamed live via
+        // `content`). Persist it explicitly so later prompts can refer
+        // back to what the agent SAID — mirroring the chat REPL, which
+        // also pushes `response.content` as an assistant message. Guard
+        // against double-append for turns where messages already ends
+        // with that assistant reply. Skip entirely on a CANCELLED turn:
+        // `content` there is a partial/aborted stream, and persisting it
+        // would condition the next prompt on a reply the client never
+        // completed.
+        let already_persisted = matches!(
+            h.last(),
+            Some(last) if last.role == octos_core::MessageRole::Assistant && last.content == assistant_reply
+        );
+        #[allow(clippy::needless_late_init)]
+        if !cancelled && !assistant_reply.is_empty() && !already_persisted {
+            h.push(octos_core::Message {
+                role: octos_core::MessageRole::Assistant,
+                content: assistant_reply,
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        fresh = h
+            .get(persisted_upto..)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+    }
+
+    // Write this turn through to the store so it outlives the process.
+    //
+    // Everything above only mutated an in-memory Vec, which is why a kill -9
+    // left the agent with no idea what it had been doing while the fleet
+    // reported it healthy. Only what this turn added is written: the store
+    // appends, so re-sending earlier turns would duplicate them.
+    //
+    // A store failure is logged, never fatal — losing persistence must not also
+    // lose the turn the agent just completed.
+    if let Some(store) = session.session_store.as_ref() {
+        if !fresh.is_empty() {
+            // Every message this turn produced shares one thread id.
+            //
+            // The store is fail-closed for Assistant and Tool rows:
+            // derive_thread_id_for_new_write rejects them outright unless the
+            // caller has stamped the originating turn's thread_id, because a
+            // derived one picked the wrong sibling user under rapid-fire
+            // turns. Unstamped, the user row persisted and the assistant row
+            // was rejected — a stored conversation with the answers missing,
+            // which is worse than none.
+            let has_user_row = fresh
+                .iter()
+                .any(|m| matches!(m.role, octos_core::MessageRole::User));
+            let turn_thread = fresh
+                .iter()
+                .find(|m| matches!(m.role, octos_core::MessageRole::User))
+                .and_then(|m| m.thread_id.clone().or_else(|| m.client_message_id.clone()))
+                .unwrap_or_else(|| {
+                    // No user row to inherit from, so there is nothing to
+                    // stamp these rows onto. Minting an id keeps the write
+                    // fail-OPEN rather than dropping the turn, but it
+                    // creates exactly the orphan the store's fail-closed
+                    // check exists to prevent: assistant/tool rows in a
+                    // thread containing no user message.
+                    let minted = uuid::Uuid::now_v7().to_string();
+                    if synthetic_user_row {
+                        // Expected on auto_respond turns: they are started by
+                        // host events, whose System rows are not thread-scoped,
+                        // and the synthetic user row was deliberately not
+                        // persisted — so the agent's own rows get their own
+                        // (user-less) thread rather than being lost.
+                        tracing::debug!(
+                            thread_id = %minted,
+                            rows = fresh.len(),
+                            "auto_respond turn produced no user row; persisting its \
+                             messages under a MINTED thread id"
+                        );
+                    } else {
+                        // Expected to be unreachable for a real prompt (the
+                        // loop always appends its user row) — say so out loud
+                        // rather than silently converting "we do not know the
+                        // thread" into "invent one", which is what made the
+                        // original thread-id bug so expensive to find.
+                        tracing::warn!(
+                            thread_id = %minted,
+                            rows = fresh.len(),
+                            has_user_row,
+                            "ACP prompt turn produced no user row; persisting its \
+                             messages under a MINTED thread id — they will load \
+                             as a thread with no user message"
+                        );
+                    }
+                    minted
+                });
+
+            let mut guard = store.lock().await;
+            for mut message in fresh {
+                if message.thread_id.is_none() {
+                    message.thread_id = Some(turn_thread.clone());
+                }
+                // Carry on rather than break: the rows are independent, and
+                // dropping the rest because one failed loses more than it saves.
+                if let Err(e) = guard.add_message(&session.session_key, message).await {
+                    tracing::warn!(
+                        error = %e, session = %session.session_key.0,
+                        "failed to persist an ACP message; it will not survive a restart"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Handle `session/cancel`: abort the in-flight turn for the given session.
@@ -1812,6 +2335,8 @@ async fn load_session_locked(
         session_store,
         history: Mutex::new(history.clone()),
         shutdown,
+        active_turns: std::sync::atomic::AtomicUsize::new(0),
+        fold_queue: Mutex::new(Vec::new()),
     });
 
     map.insert(req.session_id.clone(), session);
@@ -2092,6 +2617,8 @@ fn replay_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use agent_client_protocol::{JsonRpcMessage, JsonRpcResponse};
 
     use agent_client_protocol::schema::v1::{
         EnvVariable, HttpHeader, McpServerHttp, McpServerSse, McpServerStdio,
@@ -3346,5 +3873,92 @@ done
             sessions.lock().await.contains_key(&sid),
             "the winning load's session is the one that stays live"
         );
+    }
+
+    // ── `session/notify` wire contract (Robrix P3) ──────────────────────────
+    //
+    // The extension request is dispatched by Rust type exactly like a spec
+    // request; these pin the JSON-RPC shape so the embedding side (Robrix's
+    // `a2app_agent`) can be written against it without round-tripping: snake_case
+    // fields (with `sessionId` accepted as an ACP-convention alias), `events`
+    // required, `auto_respond` defaulting to false and `if_busy` defaulting to
+    // `drop`.
+
+    #[test]
+    fn notify_request_matches_the_session_notify_method() {
+        assert!(NotifyRequest::matches_method("session/notify"));
+        assert!(!NotifyRequest::matches_method("session/prompt"));
+        let req = NotifyRequest {
+            session_id: SessionId::new("octos-test"),
+            events: vec!["one".into()],
+            auto_respond: false,
+            if_busy: NotifyIfBusy::Fold,
+        };
+        assert_eq!(req.method(), "session/notify");
+        // A non-matching method must not parse as a notify.
+        assert!(NotifyRequest::parse_message("session/prompt", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn notify_request_parses_snake_case_fields_with_defaults() {
+        // The embedding contract sends snake_case and may omit the optional
+        // fields (auto_respond -> false, if_busy -> drop).
+        let req = NotifyRequest::parse_message(
+            "session/notify",
+            &serde_json::json!({ "session_id": "octos-test", "events": ["a", "b"] }),
+        )
+        .expect("minimal snake_case notify parses");
+        assert_eq!(req.session_id.0.as_ref(), "octos-test");
+        assert_eq!(req.events, vec!["a", "b"]);
+        assert!(!req.auto_respond, "auto_respond defaults to false");
+        assert_eq!(req.if_busy, NotifyIfBusy::Drop, "if_busy defaults to drop");
+    }
+
+    #[test]
+    fn notify_request_accepts_camel_case_session_id_and_explicit_options() {
+        // ACP-convention clients use `sessionId`; the request also honors an
+        // explicit if_busy value and auto_respond.
+        let req = NotifyRequest::parse_message(
+            "session/notify",
+            &serde_json::json!({
+                "sessionId": "octos-test",
+                "events": ["a"],
+                "auto_respond": true,
+                "if_busy": "fold",
+            }),
+        )
+        .expect("camelCase sessionId notify parses");
+        assert_eq!(req.session_id.0.as_ref(), "octos-test");
+        assert!(req.auto_respond);
+        assert_eq!(req.if_busy, NotifyIfBusy::Fold);
+    }
+
+    #[test]
+    fn notify_response_serializes_queued_and_busy() {
+        let resp = NotifyResponse {
+            queued: true,
+            busy: false,
+        };
+        let json = resp
+            .clone()
+            .into_json("session/notify")
+            .expect("serializes");
+        assert_eq!(json, serde_json::json!({ "queued": true, "busy": false }));
+        let round: NotifyResponse =
+            NotifyResponse::from_value("session/notify", json).expect("round-trips");
+        assert!(round.queued && !round.busy);
+    }
+
+    #[test]
+    fn notify_request_with_empty_events_still_parses_for_handler_to_reject() {
+        // An empty events array is a client bug (one session/notify per event
+        // pass, coalesced); the handler refuses it. The parse itself must still
+        // succeed so the refusal is a clean handler error, not a -32602 frame.
+        let req = NotifyRequest::parse_message(
+            "session/notify",
+            &serde_json::json!({ "session_id": "octos-test", "events": [] }),
+        )
+        .expect("empty events parses (the handler rejects it)");
+        assert!(req.events.is_empty());
     }
 }

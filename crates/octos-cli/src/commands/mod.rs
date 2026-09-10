@@ -38,6 +38,9 @@ pub use acp::AcpCommand;
 // from docs; not part of the stable surface.
 #[doc(hidden)]
 pub use acp::{OctosAcpAgentTransport, TestAgentFactory};
+// The `session/notify` wire types (octos extension): integration tests drive
+// the real handler with typed requests, exactly like an embedding client would.
+pub use acp::{NotifyIfBusy, NotifyRequest, NotifyResponse};
 pub use admin::AdminCommand;
 pub use auth::AuthCommand;
 pub use channels::ChannelsCommand;

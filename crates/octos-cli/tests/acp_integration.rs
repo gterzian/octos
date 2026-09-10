@@ -1164,3 +1164,615 @@ done
         );
     }
 }
+
+// ── Host notifications: `session/notify` (octos extension, Robrix P3) ──────
+//
+// `session/notify` pushes host event context into a live session WITHOUT a
+// user turn. These tests drive the real handler wiring over the in-process
+// transport: an idle notify must ack without any LLM call, its events must
+// reach the model on the next prompt as `system` content (never `user`),
+// `auto_respond: true` must start a turn on an idle session, `if_busy`
+// drop/fold must behave against an in-flight turn, and notified events must
+// survive a `session/load`+resume cycle without ever surfacing as the user.
+mod host_notify_e2e {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    use agent_client_protocol::schema::v1::SessionId;
+    use octos_cli::commands::{NotifyIfBusy, NotifyRequest};
+    use octos_core::MessageRole;
+    use octos_llm::LlmProvider;
+
+    /// One `chat()` snapshot: every incoming message's role and content, so a
+    /// test can prove notified events ride the transcript as `System` context
+    /// and never as a `user` turn.
+    type SeenMessages = Arc<Mutex<Vec<Vec<(MessageRole, String)>>>>;
+
+    /// A `RecordingLlm` that also snapshots each message's ROLE, so tests can
+    /// prove notified events ride the transcript as system context — and never
+    /// as a user turn.
+    struct RoleRecordingLlm {
+        seen: SeenMessages,
+        replies: Vec<String>,
+        calls: Arc<AtomicUsize>,
+        /// When set, the FIRST `chat()` announces entry on `entered` and then
+        /// blocks until `release`, so a test can hold a turn in flight while it
+        /// drives `session/notify`.
+        entered: Option<Arc<tokio::sync::Notify>>,
+        release: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for RoleRecordingLlm {
+        async fn chat(
+            &self,
+            messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().await.push(
+                messages
+                    .iter()
+                    .map(|m| (m.role, m.content.clone()))
+                    .collect(),
+            );
+            if idx == 0 {
+                if let Some(entered) = &self.entered {
+                    entered.notify_one();
+                    if let Some(release) = &self.release {
+                        release.notified().await;
+                    }
+                }
+            }
+            let reply = self
+                .replies
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| format!("reply-{idx}"));
+            Ok(octos_llm::ChatResponse {
+                content: Some(reply),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn provider_name(&self) -> &str {
+            "role-recording-mock"
+        }
+
+        fn model_id(&self) -> &str {
+            "role-recording-1"
+        }
+    }
+
+    fn new_role_llm(seen: SeenMessages, replies: Vec<String>) -> Arc<dyn LlmProvider> {
+        Arc::new(RoleRecordingLlm {
+            seen,
+            replies,
+            calls: Arc::new(AtomicUsize::new(0)),
+            entered: None,
+            release: None,
+        })
+    }
+
+    async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Poll the session's busy state by sending probe notifies (default
+    /// `if_busy: drop`, so a busy session discards them; once idle the probes
+    /// land as harmless System rows) until one reports `busy: false`.
+    async fn wait_until_idle(
+        connection: &ConnectionTo<agent_client_protocol::Agent>,
+        session_id: &SessionId,
+    ) -> octos_cli::commands::NotifyResponse {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let ack = connection
+                .send_request(NotifyRequest {
+                    session_id: session_id.clone(),
+                    events: vec!["__idle_probe".to_string()],
+                    auto_respond: false,
+                    if_busy: NotifyIfBusy::Drop,
+                })
+                .block_task()
+                .await
+                .expect("idle probe notify is answered");
+            if !ack.busy {
+                return ack;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the session to become idle"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// `session/notify` on an idle session is acked immediately (`queued:
+    /// true`, `busy: false`) with NO LLM call; the events reach the model on
+    /// the next prompt as System-role context and are never surfaced as a user
+    /// message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_ack_idle_notify_without_llm_call_and_see_events_on_next_prompt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        let seen: SeenMessages = Arc::new(Mutex::new(Vec::new()));
+        let calls: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(RoleRecordingLlm {
+            seen: seen.clone(),
+            replies: vec!["REPLY_AFTER_NOTIFY".to_string()],
+            calls: calls.clone(),
+            entered: None,
+            release: None,
+        });
+        let factory = TestAgentFactory::new(llm, memory_dir, cwd.clone());
+        let transport = OctosAcpAgentTransport::new(factory);
+
+        let prompt_cwd = cwd.clone();
+        Client
+            .builder()
+            .name("octos-acp-notify-idle-client")
+            .on_receive_notification(
+                async move |_n: SessionNotification,
+                            _cx: ConnectionTo<agent_client_protocol::Agent>| {
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                transport,
+                |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let new_session = connection
+                        .send_request(NewSessionRequest::new(prompt_cwd.clone()))
+                        .block_task()
+                        .await?;
+                    let session_id = new_session.session_id;
+
+                    let ack = connection
+                        .send_request(NotifyRequest {
+                            session_id: session_id.clone(),
+                            events: vec!["BUILD_FINISHED_EVENT".to_string()],
+                            auto_respond: false,
+                            if_busy: NotifyIfBusy::Drop,
+                        })
+                        .block_task()
+                        .await?;
+                    assert!(ack.queued, "idle notify must queue the events");
+                    assert!(!ack.busy, "idle session must report busy: false");
+
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        0,
+                        "an idle context-only notify must never start an LLM call"
+                    );
+
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::from("USER_AFTER_NOTIFY")],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert!(
+                        matches!(prompt.stop_reason, StopReason::EndTurn),
+                        "the prompt after a notify should EndTurn; got {:?}",
+                        prompt.stop_reason
+                    );
+                    Ok(())
+                },
+            )
+            .await
+            .expect("ACP client run should complete cleanly");
+
+        let snapshots = seen.lock().await;
+        assert_eq!(snapshots.len(), 1, "exactly one chat() call (the prompt)");
+        let snapshot = &snapshots[0];
+        assert!(
+            snapshot.iter().any(|(role, content)| {
+                *role == MessageRole::System && content.contains("BUILD_FINISHED_EVENT")
+            }),
+            "the notified event must reach the model as System content; got: {snapshot:?}"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .filter(|(role, _)| *role == MessageRole::User)
+                .all(|(_, content)| !content.contains("BUILD_FINISHED_EVENT")),
+            "a notified event must never be surfaced as a user message; got: {snapshot:?}"
+        );
+    }
+
+    /// `auto_respond: true` on an idle session starts a turn through the same
+    /// path a prompt uses: the ack is immediate, the events are in the model's
+    /// context, and the model is told the turn is event-driven (NOT a user
+    /// message), with silence allowed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_start_an_auto_respond_turn_when_requested_on_idle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        let seen: SeenMessages = Arc::new(Mutex::new(Vec::new()));
+        let calls: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let llm = Arc::new(RoleRecordingLlm {
+            seen: seen.clone(),
+            replies: vec!["AUTO_REPLY".to_string()],
+            calls: calls.clone(),
+            entered: None,
+            release: None,
+        });
+        let factory = TestAgentFactory::new(llm, memory_dir, cwd.clone());
+        let transport = OctosAcpAgentTransport::new(factory);
+
+        let prompt_cwd = cwd.clone();
+        Client
+            .builder()
+            .name("octos-acp-notify-auto-respond-client")
+            .on_receive_notification(
+                async move |_n: SessionNotification,
+                            _cx: ConnectionTo<agent_client_protocol::Agent>| {
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                transport,
+                |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let new_session = connection
+                        .send_request(NewSessionRequest::new(prompt_cwd.clone()))
+                        .block_task()
+                        .await?;
+                    let session_id = new_session.session_id;
+
+                    let ack = connection
+                        .send_request(NotifyRequest {
+                            session_id: session_id.clone(),
+                            events: vec!["NEW_ROOM_MESSAGE_EVENT".to_string()],
+                            auto_respond: true,
+                            if_busy: NotifyIfBusy::Drop,
+                        })
+                        .block_task()
+                        .await?;
+                    assert!(ack.queued, "idle auto_respond notify must queue");
+                    assert!(!ack.busy, "idle session must report busy: false");
+
+                    // The turn runs in the background; wait for the model to be
+                    // called exactly once by it.
+                    wait_until("the auto_respond turn to call the LLM", || {
+                        calls.load(Ordering::SeqCst) == 1
+                    })
+                    .await;
+
+                    // Once the turn has finished, the session is idle again: a
+                    // probe notify reports busy: false (the busy counter was
+                    // decremented by the auto_respond turn).
+                    let idle_ack = wait_until_idle(&connection, &session_id).await;
+                    assert!(!idle_ack.busy, "session must be idle after the turn");
+                    Ok(())
+                },
+            )
+            .await
+            .expect("ACP client run should complete cleanly");
+
+        let snapshots = seen.lock().await;
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "the auto_respond notify must cause exactly one chat() call"
+        );
+        let snapshot = &snapshots[0];
+        assert!(
+            snapshot.iter().any(|(role, content)| {
+                *role == MessageRole::System && content.contains("NEW_ROOM_MESSAGE_EVENT")
+            }),
+            "the auto_respond turn must see the events as System context; got: {snapshot:?}"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .filter(|(role, _)| *role == MessageRole::User)
+                .any(|(_, content)| content.contains("NOT user messages")),
+            "the auto_respond turn's instruction must tell the model the events \
+             are not user messages; got: {snapshot:?}"
+        );
+    }
+
+    /// `if_busy: drop` discards events sent while a turn is in flight;
+    /// `if_busy: fold` queues them (bounded) and the NEXT turn sees them.
+    /// Both report `busy: true` truthfully in the ack.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_drop_or_fold_events_sent_while_a_turn_is_in_flight() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        let seen: SeenMessages = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm: Arc<dyn LlmProvider> = Arc::new(RoleRecordingLlm {
+            seen: seen.clone(),
+            replies: vec![
+                "FIRST_TURN_REPLY".to_string(),
+                "SECOND_TURN_REPLY".to_string(),
+            ],
+            calls: Arc::new(AtomicUsize::new(0)),
+            entered: Some(entered.clone()),
+            release: Some(release.clone()),
+        });
+        let factory = TestAgentFactory::new(llm, memory_dir, cwd.clone());
+        let transport = OctosAcpAgentTransport::new(factory);
+
+        let prompt_cwd = cwd.clone();
+        Client
+            .builder()
+            .name("octos-acp-notify-busy-client")
+            .on_receive_notification(
+                async move |_n: SessionNotification,
+                            _cx: ConnectionTo<agent_client_protocol::Agent>| {
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                transport,
+                |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let new_session = connection
+                        .send_request(NewSessionRequest::new(prompt_cwd.clone()))
+                        .block_task()
+                        .await?;
+                    let session_id = new_session.session_id;
+
+                    // Turn 1: blocks inside chat() until we release it, so a
+                    // notify dispatched meanwhile provably sees a busy session.
+                    let prompt_conn = connection.clone();
+                    let prompt_sid = session_id.clone();
+                    let first_turn = tokio::spawn(async move {
+                        let prompt = prompt_conn
+                            .send_request(PromptRequest::new(
+                                prompt_sid.clone(),
+                                vec![ContentBlock::from("BLOCKED_PROMPT")],
+                            ))
+                            .block_task()
+                            .await?;
+                        Ok::<_, agent_client_protocol::Error>(prompt.stop_reason)
+                    });
+                    entered.notified().await;
+
+                    let drop_ack = connection
+                        .send_request(NotifyRequest {
+                            session_id: session_id.clone(),
+                            events: vec!["DROPPED_WHILE_BUSY".to_string()],
+                            auto_respond: false,
+                            if_busy: NotifyIfBusy::Drop,
+                        })
+                        .block_task()
+                        .await?;
+                    assert!(drop_ack.busy, "notify during a turn must report busy");
+                    assert!(
+                        !drop_ack.queued,
+                        "if_busy=drop must not queue anything (queued: false)"
+                    );
+
+                    let fold_ack = connection
+                        .send_request(NotifyRequest {
+                            session_id: session_id.clone(),
+                            events: vec!["FOLDED_WHILE_BUSY".to_string()],
+                            auto_respond: false,
+                            if_busy: NotifyIfBusy::Fold,
+                        })
+                        .block_task()
+                        .await?;
+                    assert!(fold_ack.busy, "notify during a turn must report busy");
+                    assert!(
+                        fold_ack.queued,
+                        "if_busy=fold must queue the events for the next turn"
+                    );
+
+                    release.notify_one();
+                    let first_stop = first_turn.await.expect("first turn task joins")?;
+                    assert!(
+                        matches!(first_stop, StopReason::EndTurn),
+                        "turn 1 should EndTurn once released; got {first_stop:?}"
+                    );
+
+                    // Turn 2: must see the FOLDED event (injected before this
+                    // turn) and must NOT see the dropped one.
+                    let second = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::from("AFTER_BUSY_PROMPT")],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert!(
+                        matches!(second.stop_reason, StopReason::EndTurn),
+                        "turn 2 should EndTurn; got {:?}",
+                        second.stop_reason
+                    );
+                    Ok(())
+                },
+            )
+            .await
+            .expect("ACP client run should complete cleanly");
+
+        let snapshots = seen.lock().await;
+        assert_eq!(snapshots.len(), 2, "two prompt turns, two chat() calls");
+        let second = &snapshots[1];
+        assert!(
+            second.iter().any(|(role, content)| {
+                *role == MessageRole::System && content.contains("FOLDED_WHILE_BUSY")
+            }),
+            "the folded event must be injected before the next turn; got: {second:?}"
+        );
+        assert!(
+            second
+                .iter()
+                .filter(|(role, _)| *role == MessageRole::User)
+                .all(|(_, content)| !content.contains("FOLDED_WHILE_BUSY")),
+            "a folded event must still never surface as a user message; got: {second:?}"
+        );
+        for snapshot in snapshots.iter() {
+            for (_role, content) in snapshot {
+                assert!(
+                    !content.contains("DROPPED_WHILE_BUSY"),
+                    "an if_busy=drop event must never reach the model; got: {snapshot:?}"
+                );
+            }
+        }
+    }
+
+    /// A notified event survives a `session/load`/resume cycle (it is
+    /// persisted at notify time), and neither the reloaded model context nor
+    /// the replayed `session/update` stream surfaces it as user content.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_restore_notified_events_through_session_load_never_as_user() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        let memory_dir = tmp.path().join("memory");
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+
+        // ---- first process: notify only — no prompt, no user turn at all ----
+        let seen_one: SeenMessages = Arc::new(Mutex::new(Vec::new()));
+        let llm_one = new_role_llm(seen_one, vec!["SHOULD_NEVER_RUN".to_string()]);
+        let factory_one = TestAgentFactory::new(llm_one, memory_dir.clone(), cwd.clone())
+            .with_session_store(&sessions_dir);
+
+        let cwd_one = cwd.clone();
+        let session_id = Client
+            .builder()
+            .name("octos-acp-notify-persist-1")
+            .on_receive_notification(
+                async move |_n: SessionNotification,
+                            _cx: ConnectionTo<agent_client_protocol::Agent>| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                OctosAcpAgentTransport::new(factory_one),
+                |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let new_session = connection
+                        .send_request(NewSessionRequest::new(cwd_one.clone()))
+                        .block_task()
+                        .await?;
+                    let id = new_session.session_id.clone();
+                    let ack = connection
+                        .send_request(NotifyRequest {
+                            session_id: id.clone(),
+                            events: vec!["PERSIST_ME_EVENT".to_string()],
+                            auto_respond: false,
+                            if_busy: NotifyIfBusy::Drop,
+                        })
+                        .block_task()
+                        .await?;
+                    assert!(ack.queued, "the notify must be accepted");
+                    Ok::<_, agent_client_protocol::Error>(id)
+                },
+            )
+            .await
+            .expect("first process");
+
+        // ---- second process: same store, load, prompt, record everything ----
+        let seen_two: SeenMessages = Arc::new(Mutex::new(Vec::new()));
+        let llm_two = new_role_llm(seen_two.clone(), vec!["AFTER_LOAD_REPLY".to_string()]);
+        let factory_two = TestAgentFactory::new(llm_two, memory_dir, cwd.clone())
+            .with_session_store(&sessions_dir);
+
+        let updates: Arc<Mutex<Vec<SessionUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_for_handler = updates.clone();
+        let id_two = session_id.clone();
+        let cwd_two = cwd.clone();
+        Client
+            .builder()
+            .name("octos-acp-notify-persist-2")
+            .on_receive_notification(
+                async move |n: SessionNotification,
+                            _cx: ConnectionTo<agent_client_protocol::Agent>| {
+                    updates_for_handler.lock().await.push(n.update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                OctosAcpAgentTransport::new(factory_two),
+                |connection: ConnectionTo<agent_client_protocol::Agent>| async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(LoadSessionRequest::new(id_two.clone(), cwd_two.clone()))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(PromptRequest::new(
+                            id_two.clone(),
+                            vec![ContentBlock::from("QUESTION_AFTER_LOAD")],
+                        ))
+                        .block_task()
+                        .await?;
+                    Ok::<_, agent_client_protocol::Error>(())
+                },
+            )
+            .await
+            .expect("second process");
+
+        // The reloaded session's model context carries the event as a System
+        // row, and no User row carries it.
+        let calls = seen_two.lock().await;
+        let last = calls.last().expect("the reloaded session ran a turn");
+        assert!(
+            last.iter().any(|(role, content)| {
+                *role == MessageRole::System && content.contains("PERSIST_ME_EVENT")
+            }),
+            "a notified event must survive session/load as System context; got: {last:?}"
+        );
+        assert!(
+            last.iter()
+                .filter(|(role, _)| *role == MessageRole::User)
+                .all(|(_, content)| !content.contains("PERSIST_ME_EVENT")),
+            "a reloaded notified event must never be surfaced as a user message; got: {last:?}"
+        );
+
+        // The load replay (all `session/update`s the second client received)
+        // must not contain the event as a user message chunk either.
+        let recorded = updates.lock().await;
+        let user_texts: Vec<String> = recorded.iter().filter_map(user_message_text).collect();
+        assert!(
+            user_texts.iter().all(|t| !t.contains("PERSIST_ME_EVENT")),
+            "session/load must not replay a notified event as user speech; got: {recorded:?}"
+        );
+    }
+}
