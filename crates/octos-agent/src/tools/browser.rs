@@ -297,6 +297,17 @@ impl Tool for BrowserTool {
                     ..Default::default()
                 });
             }
+            // The host's own per-URL internet gate. Headless Chrome cannot be
+            // re-gated per redirect hop yet (see the residual note below), so
+            // the initial navigation host is what the user approves.
+            let host = parsed_url.host_str().unwrap_or_default();
+            if let Err(msg) = super::request_network_access("browser", host, url).await {
+                return Ok(ToolResult {
+                    output: msg,
+                    success: false,
+                    ..Default::default()
+                });
+            }
             // KNOWN RESIDUAL (tracked separately): this validates only the
             // INITIAL navigation URL. Headless Chrome then follows HTTP 30x,
             // <meta refresh>, and JS `location=` redirects internally with no

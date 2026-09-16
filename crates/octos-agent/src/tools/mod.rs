@@ -395,6 +395,75 @@ tokio::task_local! {
     pub static TOOL_APPROVAL_CTX: Arc<dyn ToolApprovalRequester>;
 }
 
+/// Request emitted by a tool before it touches the public internet: the host
+/// it means to reach and the full URL when one is known. The host is what a
+/// per-URL permission decision is keyed on (subdomain matching is the host's
+/// policy), so the exact path never has to round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkAccessRequest {
+    /// The tool asking (e.g. `web_fetch`, `web_search`, `browser`).
+    pub tool_name: String,
+    /// The host the tool intends to reach, lower-cased by the caller.
+    pub host: String,
+    /// The full URL when the tool has one; the host is authoritative.
+    pub url: String,
+}
+
+/// The host's answer to a [`NetworkAccessRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkAccessDecision {
+    Allow,
+    Deny,
+}
+
+/// Async internet-access bridge provided by the host. Scoped per turn via
+/// [`NETWORK_ACCESS_CTX`], so the web tools can block on a oneshot until the
+/// host (Robrix) grants or refuses the host. When unset, the tools fail
+/// closed: internet access is never assumed just because no gate is wired.
+#[async_trait]
+pub trait NetworkAccessRequester: Send + Sync {
+    async fn request_network_access(
+        &self,
+        request: NetworkAccessRequest,
+    ) -> NetworkAccessDecision;
+}
+
+tokio::task_local! {
+    /// Optional task-local internet-access bridge scoped around a turn by the
+    /// host. See [`NetworkAccessRequester`].
+    pub static NETWORK_ACCESS_CTX: Arc<dyn NetworkAccessRequester>;
+}
+
+/// Ask the host whether a tool may reach `url`/`host`; fail closed when no
+/// host bridge is attached. Every web tool calls this before opening a socket
+/// (and `web_fetch` on every redirect hop), so a host the user has not allowed
+/// is refused before any bytes leave the machine.
+pub(crate) async fn request_network_access(
+    tool_name: &str,
+    host: &str,
+    url: &str,
+) -> Result<(), String> {
+    let requester = NETWORK_ACCESS_CTX.try_with(Clone::clone).ok();
+    let Some(requester) = requester else {
+        return Err(format!(
+            "network access to `{host}` was denied: this session has no host approval channel"
+        ));
+    };
+    match requester
+        .request_network_access(NetworkAccessRequest {
+            tool_name: tool_name.to_string(),
+            host: host.to_ascii_lowercase(),
+            url: url.to_string(),
+        })
+        .await
+    {
+        NetworkAccessDecision::Allow => Ok(()),
+        NetworkAccessDecision::Deny => {
+            Err(format!("network access to `{host}` was denied by the user"))
+        }
+    }
+}
+
 /// Request emitted by the `ask_user_question` tool when it asks the user a
 /// structured multiple-choice question mid-turn (UPCR-2026-023).
 ///

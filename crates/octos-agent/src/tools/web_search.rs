@@ -35,6 +35,21 @@ use tracing::{info, warn};
 
 use super::{Tool, ToolResult};
 
+/// Ask the host to allow reaching a search provider, before the socket is
+/// opened. Returns the model-readable refusal the caller should propagate on
+/// a denial, or `None` when the host allowed the request (or no host bridge
+/// is attached, in which case the web tool fails closed inside `request_network_access`).
+async fn gate_search_provider(host: &str, url: &str) -> Option<ToolResult> {
+    super::request_network_access("web_search", host, url)
+        .await
+        .err()
+        .map(|msg| ToolResult {
+            output: msg,
+            success: false,
+            ..Default::default()
+        })
+}
+
 /// Detect whether a `ToolResult` represents a quota-exhausted or rate-limited
 /// response from a search provider. Used to drive auto-rotation across the
 /// provider chain in `WebSearchTool::execute` (M8.10-B, see issue #575).
@@ -551,6 +566,9 @@ impl WebSearchTool {
     // --- Tavily (AI-optimized search) ---
 
     async fn tavily_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
+        if let Some(denied) = gate_search_provider("api.tavily.com", "https://api.tavily.com/search").await {
+            return Ok(denied);
+        }
         let body = serde_json::json!({
             "query": query,
             "max_results": count,
@@ -609,6 +627,9 @@ impl WebSearchTool {
     // --- Exa (neural search) ---
 
     async fn exa_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
+        if let Some(denied) = gate_search_provider("api.exa.ai", "https://api.exa.ai/search").await {
+            return Ok(denied);
+        }
         let body = serde_json::json!({
             "query": query,
             "type": "auto",
@@ -684,6 +705,9 @@ impl WebSearchTool {
     // --- Perplexity Sonar ---
 
     async fn perplexity_search(&self, query: &str, api_key: &str) -> Result<ToolResult> {
+        if let Some(denied) = gate_search_provider("api.perplexity.ai", "https://api.perplexity.ai/chat/completions").await {
+            return Ok(denied);
+        }
         let body = serde_json::json!({
             "model": "sonar",
             "messages": [{"role": "user", "content": query}],
@@ -749,6 +773,9 @@ impl WebSearchTool {
     // --- You.com ---
 
     async fn you_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
+        if let Some(denied) = gate_search_provider("ydc-index.io", "https://ydc-index.io/v1/search").await {
+            return Ok(denied);
+        }
         let response = self
             .client
             .get("https://ydc-index.io/v1/search")
@@ -807,6 +834,9 @@ impl WebSearchTool {
     // --- Brave Search ---
 
     async fn brave_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
+        if let Some(denied) = gate_search_provider("api.search.brave.com", "https://api.search.brave.com/res/v1/web/search").await {
+            return Ok(denied);
+        }
         let response = self
             .client
             .get("https://api.search.brave.com/res/v1/web/search")
@@ -864,6 +894,9 @@ impl WebSearchTool {
 
     async fn ddg_search(&self, query: &str, count: u8) -> Result<ToolResult> {
         let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoded(query));
+        if let Some(denied) = gate_search_provider("html.duckduckgo.com", &url).await {
+            return Ok(denied);
+        }
 
         let response = self
             .client
@@ -964,6 +997,13 @@ impl WebSearchTool {
         // Bound the entire launch + navigation + extraction so a stuck Chrome
         // cannot block the agent. On timeout the session future is dropped,
         // whose `Drop`/`shutdown` kills the child process (see browser.rs).
+        // Gate the search engine host BEFORE launching Chrome: the CDP search
+        // navigates to Bing, so that host must be allowed like any other.
+        if let Some(denied) =
+            gate_search_provider("www.bing.com", "https://www.bing.com/search").await
+        {
+            return Ok(denied);
+        }
         let fut = render_and_parse_bing(executable, query, count);
         match tokio::time::timeout(bound, fut).await {
             Ok(Ok(results)) => {

@@ -237,6 +237,14 @@ async fn ssrf_safe_fetch(
         // Validate the URL and resolve DNS (fail-closed on DNS error).
         let check = super::ssrf::check_ssrf_with_addrs(&current_url).await?;
 
+        // The host's own per-URL internet gate, applied to EVERY hop (not just
+        // the initial URL), so a redirect cannot smuggle the fetch onto a host
+        // the user never approved. Fails closed when no host bridge is scoped.
+        // Runs after the SSRF check so a private/internal host is still
+        // refused by SSRF (whose message is more specific) rather than as a
+        // permission denial.
+        super::request_network_access("web_fetch", &host, &current_url).await?;
+
         // Build a per-request client with redirects disabled and DNS pinned.
         let mut builder = Client::builder()
             .timeout(Duration::from_secs(30))

@@ -71,9 +71,9 @@ use crate::progress::ProgressEvent;
 use crate::task_supervisor::{TaskRuntimeState, TaskTerminalGuard};
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{
-    ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolApprovalDecision,
-    ToolApprovalRequest, ToolApprovalRequester, ToolContext, USER_QUESTION_CTX,
-    UserQuestionRequester,
+    ConcurrencyClass, NETWORK_ACCESS_CTX, TOOL_APPROVAL_CTX, TOOL_CTX, TURN_ATTACHMENT_CTX,
+    ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolContext,
+    USER_QUESTION_CTX, UserQuestionRequester,
 };
 use crate::workspace_contract::{
     SpawnTaskContractResult, enforce_spawn_task_contract_with_args_and_output,
@@ -617,6 +617,12 @@ impl Agent {
             TOOL_APPROVAL_CTX.try_with(std::sync::Arc::clone).ok();
         let captured_user_question_ctx: Option<std::sync::Arc<dyn UserQuestionRequester>> =
             USER_QUESTION_CTX.try_with(std::sync::Arc::clone).ok();
+        // The per-URL internet gate (web_search / web_fetch / browser) is a
+        // task-local too, so it must be carried into this spawned task the
+        // same way; otherwise a web tool finds no bridge and fails closed
+        // (denied with no prompt).
+        let captured_network_ctx: Option<std::sync::Arc<dyn crate::tools::NetworkAccessRequester>> =
+            NETWORK_ACCESS_CTX.try_with(std::sync::Arc::clone).ok();
 
         tokio::spawn(async move {
             let tool_start = Instant::now();
@@ -2081,22 +2087,32 @@ impl Agent {
                     .execute_with_context(&ctx, &tc_name, &effective_args)
                     .await
             });
-            let result = match (&captured_approval_ctx, &captured_user_question_ctx) {
-                (Some(approval), Some(question)) => {
-                    TOOL_APPROVAL_CTX
-                        .scope(
-                            approval.clone(),
-                            USER_QUESTION_CTX.scope(question.clone(), exec_future),
-                        )
-                        .await
+            // Apply the approval and user-question bridges inside, then wrap
+            // the whole thing in the network bridge so it too is active across
+            // the awaits. `run_tool` owns `exec_future`; only one of the two
+            // outer arms consumes it.
+            let run_tool = async move {
+                match (&captured_approval_ctx, &captured_user_question_ctx) {
+                    (Some(approval), Some(question)) => {
+                        TOOL_APPROVAL_CTX
+                            .scope(
+                                approval.clone(),
+                                USER_QUESTION_CTX.scope(question.clone(), exec_future),
+                            )
+                            .await
+                    }
+                    (Some(approval), None) => {
+                        TOOL_APPROVAL_CTX.scope(approval.clone(), exec_future).await
+                    }
+                    (None, Some(question)) => {
+                        USER_QUESTION_CTX.scope(question.clone(), exec_future).await
+                    }
+                    (None, None) => exec_future.await,
                 }
-                (Some(approval), None) => {
-                    TOOL_APPROVAL_CTX.scope(approval.clone(), exec_future).await
-                }
-                (None, Some(question)) => {
-                    USER_QUESTION_CTX.scope(question.clone(), exec_future).await
-                }
-                (None, None) => exec_future.await,
+            };
+            let result = match &captured_network_ctx {
+                Some(network) => NETWORK_ACCESS_CTX.scope(network.clone(), run_tool).await,
+                None => run_tool.await,
             };
 
             let duration = tool_start.elapsed();
