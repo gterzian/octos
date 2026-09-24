@@ -83,12 +83,12 @@ use octos_bus::session::SessionManager;
 use octos_core::SessionKey;
 
 use super::Executable;
-mod host_managed;
+pub mod host_managed;
 #[cfg(feature = "api")]
 mod oup;
 #[cfg(feature = "api")]
 use crate::config::Config;
-pub use host_managed::{NotifyIfBusy, NotifyRequest, NotifyResponse};
+pub use host_managed::{NotifyIfBusy, NotifyRequest, NotifyResponse, serve};
 
 /// Default for [`AcpCommand::max_iterations`]. Shared by the clap default and
 /// the `Default` impl so an embedder building the command by hand gets the same

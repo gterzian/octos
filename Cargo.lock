@@ -4813,9 +4813,11 @@ dependencies = [
 name = "octos-ffi"
 version = "2.0.3-rc.11"
 dependencies = [
+ "agent-client-protocol",
  "async-trait",
  "chrono",
  "eyre",
+ "futures",
  "libc",
  "octos-agent",
  "octos-cli",

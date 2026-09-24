@@ -501,7 +501,13 @@ fn error(error: impl std::fmt::Display) -> AcpError {
 
 /// Call only after OS confinement; tests pass an in-process transport and
 /// exercise the same protocol without changing their own process sandbox.
-pub(super) async fn serve(
+///
+/// Exposed for embedding hosts that supply their own transport (the
+/// `octos-ffi` host-managed bridge forwards ACP frames over such a transport,
+/// e.g. an App Extension's XPC connection). Anonymous means the host owns the
+/// process compartment, so callers using a non-subprocess transport must NOT
+/// call `octos_sandbox::confine_host_managed` first.
+pub async fn serve(
     max_iterations: u32,
     sandbox: &'static str,
     transport: impl agent_client_protocol::ConnectTo<AcpAgentRole> + 'static,

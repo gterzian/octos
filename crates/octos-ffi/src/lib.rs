@@ -67,6 +67,9 @@ use octos_memory::{
 use serde::Deserialize;
 use serde_json::json;
 
+/// Host-managed ACP loop over a caller-supplied transport (App Extension/XPC).
+pub mod host_managed;
+
 /// Monotonic counter used to give every runtime a unique on-disk scratch dir
 /// for its (minimal) episodic memory store.
 static MEM_COUNTER: AtomicU64 = AtomicU64::new(0);
